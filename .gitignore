@@ -9,6 +9,8 @@ __pycache__/
 # Logs
 *.log
 bot_logs.log
+error.log
+debug.log
 
 # Virtual environment
 venv/
@@ -42,3 +44,13 @@ dist/
 # Miscellaneous
 *.bak
 *.swp
+*.tmp
+
+# Sensitive configuration files
+*.json
+*.yaml
+*.yml
+
+# Database files
+*.db
+*.sqlite3
