@@ -1,0 +1,44 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment variables
+.env
+
+# Logs
+*.log
+bot_logs.log
+
+# Virtual environment
+venv/
+env/
+.env
+
+# Byte-compiled files
+*.pyc
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDE-specific files
+.vscode/
+.idea/
+
+# Test coverage reports
+htmlcov/
+.coverage
+*.cover
+
+# Pytest cache
+.pytest_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Miscellaneous
+*.bak
+*.swp
