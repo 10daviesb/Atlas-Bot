@@ -3,3 +3,4 @@ hikari-lightbulb
 python-dotenv
 aiosqlite
 hikari-ongaku
+aiohttp
