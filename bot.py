@@ -41,7 +41,7 @@ def load_extensions():
 load_extensions()
 
 @bot.listen(hikari.StartedEvent)
-async def on_starting(event: hikari.StartingEvent) -> None:
+async def on_starting(event: hikari.StartedEvent) -> None:
     await bot.rest.fetch_application()  # Ensures bot fetches latest command state
     await bot.sync_application_commands()
     print("✅ Synced application commands.")

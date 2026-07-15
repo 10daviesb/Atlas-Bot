@@ -1,3 +1,4 @@
+import datetime
 import lightbulb
 import hikari
 import logging
@@ -84,7 +85,8 @@ async def purge(ctx):
         return
 
     try:
-        await ctx.bot.rest.delete_messages(channel, await ctx.bot.rest.fetch_messages(channel)[:amount])
+        messages = await ctx.bot.rest.fetch_messages(channel).limit(amount)
+        await ctx.bot.rest.delete_messages(channel, messages)
         await ctx.respond(f"✅ Deleted {amount} messages.")
         logger.info(f"{ctx.author} purged {amount} messages in {channel}")
     except Exception as e:
@@ -106,15 +108,13 @@ async def timeout(ctx: lightbulb.Context) -> None:
         await ctx.respond("❌ Please specify a duration greater than 0 seconds.")
         return
 
-    # Calculate the timeout end time in ISO format with a Z suffix (UTC)
-    timeout_until = datetime.datetime.utcnow() + datetime.timedelta(seconds=duration)
-    timeout_until_iso = timeout_until.isoformat() + "Z"
+    timeout_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=duration)
 
     try:
         await ctx.bot.rest.edit_member(
             guild,
             member,
-            communication_disabled_until=timeout_until_iso
+            communication_disabled_until=timeout_until
         )
         await ctx.respond(f"✅ {member} has been timed out for {duration} seconds.")
         logger.info(f"{ctx.author} timed out {member} for {duration} seconds.")

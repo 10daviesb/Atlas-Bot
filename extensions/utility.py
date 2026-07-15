@@ -19,6 +19,8 @@ async def ping(ctx):
     logger.info(f"Ping command used by {ctx.author}")
 
 @plugin.command()
+@lightbulb.command("uptime", "Show how long the bot has been running.")
+@lightbulb.implements(lightbulb.SlashCommand)
 async def uptime(ctx):
     current_time = time.time()
     uptime_seconds = int(current_time - BOT_START_TIME)
