@@ -50,6 +50,7 @@ dist/
 *.json
 *.yaml
 *.yml
+!.github/**/*.yml
 
 # Database files
 *.db
