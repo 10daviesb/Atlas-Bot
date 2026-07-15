@@ -2,6 +2,7 @@ import traceback
 import lightbulb
 import logging
 from config import config
+from errors import ExtensionDisabledError, CommandDisabledError, MissingCommandRoleError
 
 logger = logging.getLogger(__name__)
 plugin = lightbulb.Plugin("ErrorHandler")
@@ -16,6 +17,18 @@ async def on_command_error(event: lightbulb.CommandErrorEvent) -> None:
 
     if isinstance(error, lightbulb.NotEnoughArguments):
         await event.context.respond("❌ Missing required arguments.")
+        return
+
+    if isinstance(error, ExtensionDisabledError):
+        await event.context.respond(f"❌ The **{error.extension.title()}** extension is disabled in this server.")
+        return
+
+    if isinstance(error, CommandDisabledError):
+        await event.context.respond(f"❌ The `/{error.command}` command is disabled in this server.")
+        return
+
+    if isinstance(error, MissingCommandRoleError):
+        await event.context.respond(f"❌ You need the <@&{error.role_id}> role to use this command.")
         return
 
     if isinstance(error, lightbulb.CheckFailure):
