@@ -12,6 +12,7 @@ plugin = lightbulb.Plugin("Leveling")
 DB_PATH = "atlas.db"
 XP_COOLDOWN = 60  # seconds between XP grants per user
 XP_MIN, XP_MAX = 15, 25
+IMAGE_XP_MIN, IMAGE_XP_MAX = 5, 15  # bonus for messages with images
 
 # In-memory cooldown: (guild_id, user_id) -> last grant time
 _cooldowns: dict[tuple[int, int], float] = {}
@@ -57,6 +58,8 @@ async def on_message(event: hikari.GuildMessageCreateEvent) -> None:
     _cooldowns[key] = now
 
     xp_gain = random.randint(XP_MIN, XP_MAX)
+    if any((a.media_type or "").startswith("image/") for a in event.message.attachments):
+        xp_gain += random.randint(IMAGE_XP_MIN, IMAGE_XP_MAX)
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
