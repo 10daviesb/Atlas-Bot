@@ -4,22 +4,23 @@ import lightbulb
 import logging
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("ReactionRoles")
+
+loader = lightbulb.Loader()
 
 DB_PATH = "atlas.db"
+_rest: hikari.api.RESTClient | None = None
+_bot_id: int | None = None
 
-# (message_id, emoji_str) -> role_id
-_cache: dict[tuple[int, str], int] = {}
-
-
-def _emoji_key(emoji: hikari.Emoji) -> str:
-    if isinstance(emoji, hikari.CustomEmoji):
-        return str(emoji.id)
-    return str(emoji)
+# (guild_id, message_id, emoji) -> role_id
+_reaction_roles: dict[tuple[int, int, str], int] = {}
 
 
-@plugin.listener(hikari.StartedEvent)
+@loader.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest, _bot_id
+    _rest = event.app.rest
+    me = await _rest.fetch_my_user()
+    _bot_id = me.id
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS reaction_roles (
@@ -27,131 +28,119 @@ async def on_started(event: hikari.StartedEvent) -> None:
                 message_id INTEGER NOT NULL,
                 emoji      TEXT    NOT NULL,
                 role_id    INTEGER NOT NULL,
-                PRIMARY KEY (message_id, emoji)
+                PRIMARY KEY (guild_id, message_id, emoji)
             )
         """)
         await db.commit()
-        async with db.execute("SELECT message_id, emoji, role_id FROM reaction_roles") as cur:
-            for message_id, emoji, role_id in await cur.fetchall():
-                _cache[(message_id, emoji)] = role_id
-    logger.info(f"Reaction roles loaded: {len(_cache)} entries.")
+        async with db.execute("SELECT guild_id, message_id, emoji, role_id FROM reaction_roles") as cur:
+            for guild_id, message_id, emoji, role_id in await cur.fetchall():
+                _reaction_roles[(guild_id, message_id, emoji)] = role_id
+    logger.info(f"ReactionRoles loaded: {len(_reaction_roles)} entries.")
 
 
-@plugin.listener(hikari.GuildReactionAddEvent)
+@loader.listener(hikari.GuildReactionAddEvent)
 async def on_reaction_add(event: hikari.GuildReactionAddEvent) -> None:
-    if event.user_id == plugin.bot.get_me().id:
+    if event.user_id == _bot_id or _rest is None:
         return
-    role_id = _cache.get((event.message_id, _emoji_key(event.emoji)))
+    emoji_str = str(event.emoji_name)
+    role_id = _reaction_roles.get((event.guild_id, event.message_id, emoji_str))
     if role_id:
         try:
-            await plugin.bot.rest.add_role_to_member(event.guild_id, event.user_id, role_id)
+            await _rest.add_role_to_member(event.guild_id, event.user_id, role_id, reason="Reaction role")
         except Exception as e:
-            logger.warning(f"Failed to assign reaction role: {e}")
+            logger.warning(f"Failed to add reaction role: {e}")
 
 
-@plugin.listener(hikari.GuildReactionDeleteEvent)
+@loader.listener(hikari.GuildReactionDeleteEvent)
 async def on_reaction_remove(event: hikari.GuildReactionDeleteEvent) -> None:
-    role_id = _cache.get((event.message_id, _emoji_key(event.emoji)))
+    if event.user_id == _bot_id or _rest is None:
+        return
+    emoji_str = str(event.emoji_name)
+    role_id = _reaction_roles.get((event.guild_id, event.message_id, emoji_str))
     if role_id:
         try:
-            await plugin.bot.rest.remove_role_from_member(event.guild_id, event.user_id, role_id)
+            await _rest.remove_role_from_member(event.guild_id, event.user_id, role_id, reason="Reaction role removed")
         except Exception as e:
             logger.warning(f"Failed to remove reaction role: {e}")
 
 
-@plugin.command()
-@lightbulb.command("reactionrole", "Manage reaction roles.")
-@lightbulb.implements(lightbulb.SlashCommandGroup)
-async def reactionrole(ctx: lightbulb.Context) -> None:
-    pass
+# /reactionrole group
+rr_group = lightbulb.Group("reactionrole", "Manage reaction roles.")
 
 
-@reactionrole.child
-@lightbulb.option("role", "Role to assign.", type=hikari.Role)
-@lightbulb.option("emoji", "Emoji to react with.", type=str)
-@lightbulb.option("message_id", "ID of the target message.", type=str)
-@lightbulb.command("add", "Attach a role to a reaction on a message.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def rr_add(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_ROLES:
-        await ctx.respond("❌ You need the **Manage Roles** permission.")
-        return
-    try:
-        message_id = int(ctx.options.message_id)
-    except ValueError:
-        await ctx.respond("❌ Invalid message ID.")
-        return
+@rr_group.register
+class RRAdd(lightbulb.SlashCommand, name="add", description="Add a reaction role to a message."):
+    message_id = lightbulb.string("message_id", "Message ID.")
+    emoji = lightbulb.string("emoji", "Emoji to react with.")
+    role = lightbulb.role("role", "Role to assign.")
 
-    emoji: str = ctx.options.emoji.strip()
-    role: hikari.Role = ctx.options.role
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_ROLES):
+            await ctx.respond("❌ You need the **Manage Roles** permission.")
+            return
+        try:
+            mid = int(self.message_id)
+        except ValueError:
+            await ctx.respond("❌ Invalid message ID.")
+            return
 
-    _cache[(message_id, emoji)] = role.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT OR REPLACE INTO reaction_roles (guild_id, message_id, emoji, role_id)
-            VALUES (?, ?, ?, ?)
-        """, (ctx.guild_id, message_id, emoji, role.id))
-        await db.commit()
+        emoji = self.emoji.strip()
+        role = self.role
+        _reaction_roles[(ctx.guild_id, mid, emoji)] = role.id
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO reaction_roles (guild_id, message_id, emoji, role_id) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, message_id, emoji) DO UPDATE SET role_id = excluded.role_id
+            """, (ctx.guild_id, mid, emoji, role.id))
+            await db.commit()
 
-    try:
-        await plugin.bot.rest.add_reaction(ctx.channel_id, message_id, emoji)
-    except Exception:
-        pass
+        if _rest:
+            try:
+                await _rest.add_reaction(ctx.channel_id, mid, emoji)
+            except Exception:
+                pass
 
-    await ctx.respond(f"✅ Reacting {emoji} on message `{message_id}` will assign **{role.name}**.")
-    logger.info(f"Reaction role added: {emoji} -> {role.name} on msg {message_id}")
-
-
-@reactionrole.child
-@lightbulb.option("emoji", "Emoji to remove.", type=str)
-@lightbulb.option("message_id", "ID of the target message.", type=str)
-@lightbulb.command("remove", "Remove a reaction role.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def rr_remove(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_ROLES:
-        await ctx.respond("❌ You need the **Manage Roles** permission.")
-        return
-    try:
-        message_id = int(ctx.options.message_id)
-    except ValueError:
-        await ctx.respond("❌ Invalid message ID.")
-        return
-
-    emoji: str = ctx.options.emoji.strip()
-    _cache.pop((message_id, emoji), None)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM reaction_roles WHERE message_id = ? AND emoji = ?", (message_id, emoji))
-        await db.commit()
-
-    await ctx.respond(f"✅ Reaction role for {emoji} on message `{message_id}` removed.")
+        await ctx.respond(f"✅ Reaction role set: {emoji} → {role.mention}")
 
 
-@reactionrole.child
-@lightbulb.command("list", "List all reaction roles in this server.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def rr_list(ctx: lightbulb.Context) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT message_id, emoji, role_id FROM reaction_roles WHERE guild_id = ?",
-            (ctx.guild_id,)
-        ) as cur:
-            rows = await cur.fetchall()
+@rr_group.register
+class RRRemove(lightbulb.SlashCommand, name="remove", description="Remove a reaction role from a message."):
+    message_id = lightbulb.string("message_id", "Message ID.")
+    emoji = lightbulb.string("emoji", "Emoji of the reaction role to remove.")
 
-    if not rows:
-        await ctx.respond("📭 No reaction roles set up.")
-        return
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_ROLES):
+            await ctx.respond("❌ You need the **Manage Roles** permission.")
+            return
+        try:
+            mid = int(self.message_id)
+        except ValueError:
+            await ctx.respond("❌ Invalid message ID.")
+            return
+        emoji = self.emoji.strip()
+        key = (ctx.guild_id, mid, emoji)
+        if key not in _reaction_roles:
+            await ctx.respond("❌ No reaction role found for that emoji/message.")
+            return
+        del _reaction_roles[key]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM reaction_roles WHERE guild_id = ? AND message_id = ? AND emoji = ?", (ctx.guild_id, mid, emoji))
+            await db.commit()
+        await ctx.respond(f"✅ Reaction role for {emoji} removed.")
 
-    lines = ["**Reaction Roles**"]
-    for message_id, emoji, role_id in rows:
-        lines.append(f"{emoji}  on msg `{message_id}` → <@&{role_id}>")
-    await ctx.respond("\n".join(lines))
+
+@rr_group.register
+class RRList(lightbulb.SlashCommand, name="list", description="List all reaction roles in this server."):
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        entries = [(mid, emoji, rid) for (gid, mid, emoji), rid in _reaction_roles.items() if gid == ctx.guild_id]
+        if not entries:
+            await ctx.respond("ℹ️ No reaction roles configured.")
+            return
+        lines = [f"Message `{mid}` | {emoji} → <@&{rid}>" for mid, emoji, rid in entries[:20]]
+        await ctx.respond("**Reaction Roles:**\n" + "\n".join(lines))
 
 
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("ReactionRoles extension loaded.")
-
-
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("ReactionRoles extension unloaded.")
+loader.command(rr_group)

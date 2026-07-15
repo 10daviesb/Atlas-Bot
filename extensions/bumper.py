@@ -5,132 +5,129 @@ import lightbulb
 import logging
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("Bumper")
+
+loader = lightbulb.Loader()
 
 DB_PATH = "atlas.db"
+_rest: hikari.api.RESTClient | None = None
+
+# guild_id -> {channel_id, remind_channel_id, last_bump, interval}
+_bump_config: dict[int, dict] = {}
+_reminder_tasks: dict[int, asyncio.Task] = {}
+
 DISBOARD_ID = 302050872383242240
-BUMP_COOLDOWN = 7200  # 2 hours in seconds
-
-# Strings that appear in Disboard's bump success embed description
-_BUMP_STRINGS = ("bump done", "bumped", "server bumped")
-
-# guild_id -> {channel_id, role_id or None}
-_configs: dict[int, dict] = {}
-# guild_id -> asyncio.Task
-_pending: dict[int, asyncio.Task] = {}
+BUMP_INTERVAL = 7200  # 2 hours
 
 
-@plugin.listener(hikari.StartedEvent)
+async def _send_reminder(guild_id: int, channel_id: int) -> None:
+    await asyncio.sleep(BUMP_INTERVAL)
+    if _rest is None:
+        return
+    try:
+        await _rest.create_message(channel_id, "⏰ Time to bump the server! Use `/bump` with Disboard.")
+    except Exception as e:
+        logger.warning(f"Bump reminder failed for guild {guild_id}: {e}")
+    _reminder_tasks.pop(guild_id, None)
+
+
+@loader.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest
+    _rest = event.app.rest
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bump_config (
-                guild_id   INTEGER PRIMARY KEY,
-                channel_id INTEGER NOT NULL,
-                role_id    INTEGER
+                guild_id        INTEGER PRIMARY KEY,
+                channel_id      INTEGER NOT NULL,
+                remind_channel  INTEGER NOT NULL
             )
         """)
         await db.commit()
-        async with db.execute("SELECT guild_id, channel_id, role_id FROM bump_config") as cur:
-            for guild_id, channel_id, role_id in await cur.fetchall():
-                _configs[guild_id] = {"channel_id": channel_id, "role_id": role_id}
-    logger.info("Bumper DB initialized.")
+        async with db.execute("SELECT guild_id, channel_id, remind_channel FROM bump_config") as cur:
+            for guild_id, channel_id, remind_channel in await cur.fetchall():
+                _bump_config[guild_id] = {
+                    "channel_id": channel_id,
+                    "remind_channel": remind_channel,
+                }
+    logger.info("Bumper loaded.")
 
 
-async def _send_reminder(guild_id: int) -> None:
-    await asyncio.sleep(BUMP_COOLDOWN)
-    cfg = _configs.get(guild_id)
-    if not cfg:
-        return
-    _pending.pop(guild_id, None)
-    role_mention = f"<@&{cfg['role_id']}> " if cfg.get("role_id") else ""
-    try:
-        await plugin.bot.rest.create_message(
-            cfg["channel_id"],
-            f"🔔 {role_mention}Time to bump the server! Use `/bump` on Disboard.",
-        )
-    except Exception as e:
-        logger.warning(f"Bump reminder failed for guild {guild_id}: {e}")
+@loader.listener(hikari.StoppingEvent)
+async def on_stopping(event: hikari.StoppingEvent) -> None:
+    for task in _reminder_tasks.values():
+        task.cancel()
 
 
-def _is_bump_success(message: hikari.Message) -> bool:
-    if not message.embeds:
-        return False
-    for embed in message.embeds:
-        desc = (embed.description or "").lower()
-        if any(s in desc for s in _BUMP_STRINGS):
-            return True
-    return False
-
-
-@plugin.listener(hikari.GuildMessageCreateEvent)
+@loader.listener(hikari.GuildMessageCreateEvent)
 async def on_message(event: hikari.GuildMessageCreateEvent) -> None:
     if event.author_id != DISBOARD_ID:
         return
-    if not _configs.get(event.guild_id):
+    if not event.message.embeds:
         return
-    msg = event.message
-    if not _is_bump_success(msg):
-        return
-
-    if event.guild_id in _pending:
-        _pending[event.guild_id].cancel()
-
-    _pending[event.guild_id] = asyncio.create_task(_send_reminder(event.guild_id))
-
-    try:
-        await plugin.bot.rest.add_reaction(event.channel_id, event.message_id, "✅")
-    except Exception:
-        pass
-    logger.info(f"Bump detected in guild {event.guild_id}, reminder scheduled in 2h.")
-
-
-@plugin.command()
-@lightbulb.option("role", "Role to ping when it's time to bump (optional).", type=hikari.Role, default=None)
-@lightbulb.option("channel", "Channel to post the bump reminder in.", type=hikari.TextableGuildChannel)
-@lightbulb.command("bumpsetup", "Configure the bump reminder system.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def bumpsetup(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    channel: hikari.TextableGuildChannel = ctx.options.channel
-    role: hikari.Role | None = ctx.options.role
-    role_id = role.id if role else None
-    _configs[ctx.guild_id] = {"channel_id": channel.id, "role_id": role_id}
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO bump_config (guild_id, channel_id, role_id) VALUES (?, ?, ?)
-            ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id, role_id = excluded.role_id
-        """, (ctx.guild_id, channel.id, role_id))
-        await db.commit()
-    msg = f"✅ Bump reminders will post to {channel.mention}."
-    if role:
-        msg += f" {role.mention} will be pinged."
-    await ctx.respond(msg)
+    for embed in event.message.embeds:
+        if embed.description and "bump done" in embed.description.lower():
+            cfg = _bump_config.get(event.guild_id)
+            if not cfg:
+                return
+            # Cancel existing reminder
+            old = _reminder_tasks.pop(event.guild_id, None)
+            if old:
+                old.cancel()
+            remind_ch = cfg.get("remind_channel") or cfg["channel_id"]
+            task = asyncio.create_task(_send_reminder(event.guild_id, remind_ch))
+            _reminder_tasks[event.guild_id] = task
+            try:
+                await _rest.create_message(event.channel_id, "✅ Bump registered! I'll remind you in 2 hours.")
+            except Exception:
+                pass
+            break
 
 
-@plugin.command()
-@lightbulb.command("bumpdisable", "Disable bump reminders.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def bumpdisable(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    _configs.pop(ctx.guild_id, None)
-    if ctx.guild_id in _pending:
-        _pending.pop(ctx.guild_id).cancel()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM bump_config WHERE guild_id = ?", (ctx.guild_id,))
-        await db.commit()
-    await ctx.respond("✅ Bump reminders disabled.")
+@loader.command
+class BumpSetup(
+    lightbulb.SlashCommand,
+    name="bumpsetup",
+    description="Set up the bump reminder system.",
+):
+    channel = lightbulb.channel("channel", "Channel where bumps happen.")
+    remind_channel = lightbulb.channel("remind_channel", "Channel for bump reminders.", default=None)
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        channel = self.channel
+        remind_ch = self.remind_channel or channel
+        _bump_config[ctx.guild_id] = {
+            "channel_id": channel.id,
+            "remind_channel": remind_ch.id,
+        }
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO bump_config (guild_id, channel_id, remind_channel) VALUES (?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id, remind_channel = excluded.remind_channel
+            """, (ctx.guild_id, channel.id, remind_ch.id))
+            await db.commit()
+        await ctx.respond(f"✅ Bump reminder configured. Bump channel: {channel.mention}, remind channel: {remind_ch.mention}.")
 
 
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("Bumper extension loaded.")
-
-
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("Bumper extension unloaded.")
+@loader.command
+class BumpDisable(
+    lightbulb.SlashCommand,
+    name="bumpdisable",
+    description="Disable bump reminders.",
+):
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        _bump_config.pop(ctx.guild_id, None)
+        old = _reminder_tasks.pop(ctx.guild_id, None)
+        if old:
+            old.cancel()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM bump_config WHERE guild_id = ?", (ctx.guild_id,))
+            await db.commit()
+        await ctx.respond("✅ Bump reminders disabled.")

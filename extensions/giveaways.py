@@ -9,80 +9,90 @@ import lightbulb
 import logging
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("Giveaways")
+
+loader = lightbulb.Loader()
 
 DB_PATH = "atlas.db"
+_rest: hikari.api.RESTClient | None = None
+_bot_id: int | None = None
+
+# giveaway_id -> {guild_id, channel_id, message_id, prize, end_time, winners, ended}
+_giveaways: dict[int, dict] = {}
+_giveaway_task: asyncio.Task | None = None
+
 GIVEAWAY_EMOJI = "🎉"
 
-_DURATION_RE = re.compile(
-    r"^(?:(\d+)\s*d(?:ays?)?)?\s*(?:(\d+)\s*h(?:ours?)?)?\s*"
-    r"(?:(\d+)\s*m(?:in(?:utes?)?)?)?\s*(?:(\d+)\s*s(?:ec(?:onds?)?)?)?$",
-    re.IGNORECASE,
-)
 
-
-def _parse(text: str) -> int | None:
-    m = _DURATION_RE.match(text.strip())
-    if not m or not any(m.groups()):
+def _parse_duration(text: str) -> int | None:
+    """Parse duration string like '1h', '30m', '2d' into seconds."""
+    m = re.fullmatch(r"(\d+)([smhd])", text.strip().lower())
+    if not m:
         return None
-    d, h, mi, s = (int(v) if v else 0 for v in m.groups())
-    total = d * 86400 + h * 3600 + mi * 60 + s
-    return total if total > 0 else None
+    val, unit = int(m.group(1)), m.group(2)
+    return val * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
 
 
-def _fmt(seconds: int) -> str:
-    parts = []
-    for unit, size in [("d", 86400), ("h", 3600), ("m", 60), ("s", 1)]:
-        if seconds >= size:
-            parts.append(f"{seconds // size}{unit}")
-            seconds %= size
-    return " ".join(parts) or "0s"
+async def _end_giveaway(giveaway_id: int) -> None:
+    data = _giveaways.get(giveaway_id)
+    if not data or data.get("ended") or _rest is None:
+        return
+    data["ended"] = True
 
+    channel_id = data["channel_id"]
+    message_id = data["message_id"]
+    prize = data["prize"]
+    winner_count = data["winners"]
 
-async def _pick_winners(channel_id: int, message_id: int, count: int) -> list[int]:
-    reactors: list[int] = []
     try:
-        async for user in plugin.bot.rest.fetch_reactions_for_emoji(channel_id, message_id, GIVEAWAY_EMOJI):
-            if not user.is_bot and user.id != plugin.bot.get_me().id:
-                reactors.append(user.id)
-    except Exception as e:
-        logger.warning(f"Failed to fetch giveaway reactors: {e}")
-    return random.sample(reactors, min(count, len(reactors))) if reactors else []
-
-
-async def _end_giveaway(giveaway_id: int, channel_id: int, message_id: int, prize: str, winner_count: int) -> None:
-    winners = await _pick_winners(channel_id, message_id, winner_count)
+        reactions = await _rest.fetch_reactions_for_emoji(channel_id, message_id, GIVEAWAY_EMOJI)
+        participants = [u for u in reactions if not u.is_bot and u.id != _bot_id]
+    except Exception:
+        participants = []
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE giveaways SET ended = 1 WHERE id = ?", (giveaway_id,))
         await db.commit()
 
-    if not winners:
-        result = "No valid entries — no winner this time!"
-    else:
-        result = f"Winner{'s' if len(winners) > 1 else ''}: " + ", ".join(f"<@{w}>" for w in winners)
+    if not participants:
+        try:
+            await _rest.create_message(channel_id, f"🎉 Giveaway ended: **{prize}** — No valid participants.")
+        except Exception:
+            pass
+        return
 
+    winners = random.sample(participants, min(winner_count, len(participants)))
+    mentions = ", ".join(w.mention for w in winners)
     try:
-        await plugin.bot.rest.edit_message(
-            channel_id, message_id,
-            embed=hikari.Embed(title="🎉 Giveaway Ended", description=f"**Prize:** {prize}\n{result}", color=0xFF73FA),
+        await _rest.create_message(
+            channel_id,
+            f"🎉 Congratulations {mentions}! You won **{prize}**!"
         )
-        await plugin.bot.rest.create_message(channel_id, f"🎉 The giveaway for **{prize}** has ended! {result}")
+        msg = await _rest.fetch_message(channel_id, message_id)
+        embed = hikari.Embed(
+            title=f"🎁 {prize}",
+            description=f"Winners: {mentions}",
+            color=0xFF69B4,
+        )
+        await _rest.edit_message(channel_id, message_id, content="**GIVEAWAY ENDED**", embed=embed)
     except Exception as e:
-        logger.warning(f"Failed to post giveaway result: {e}")
+        logger.warning(f"Giveaway end failed: {e}")
 
 
-async def _schedule(delay: int, giveaway_id: int, channel_id: int, message_id: int, prize: str, winners: int) -> None:
-    await asyncio.sleep(delay)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT ended FROM giveaways WHERE id = ?", (giveaway_id,)) as cur:
-            row = await cur.fetchone()
-    if row and not row[0]:
-        await _end_giveaway(giveaway_id, channel_id, message_id, prize, winners)
+async def _giveaway_loop() -> None:
+    while True:
+        await asyncio.sleep(10)
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        for gid, data in list(_giveaways.items()):
+            if not data.get("ended") and data["end_time"] <= now:
+                await _end_giveaway(gid)
 
 
-@plugin.listener(hikari.StartedEvent)
+@loader.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest, _bot_id, _giveaway_task
+    _rest = event.app.rest
+    me = await _rest.fetch_my_user()
+    _bot_id = me.id
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS giveaways (
@@ -90,145 +100,153 @@ async def on_started(event: hikari.StartedEvent) -> None:
                 guild_id   INTEGER NOT NULL,
                 channel_id INTEGER NOT NULL,
                 message_id INTEGER,
-                prize      TEXT    NOT NULL,
+                prize      TEXT NOT NULL,
+                end_time   REAL NOT NULL,
                 winners    INTEGER NOT NULL DEFAULT 1,
-                end_time   INTEGER NOT NULL,
                 ended      INTEGER NOT NULL DEFAULT 0
             )
         """)
         await db.commit()
-        now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
         async with db.execute(
-            "SELECT id, channel_id, message_id, prize, winners, end_time FROM giveaways WHERE ended = 0 AND message_id IS NOT NULL"
+            "SELECT id, guild_id, channel_id, message_id, prize, end_time, winners FROM giveaways WHERE ended = 0"
         ) as cur:
-            rows = await cur.fetchall()
+            for row in await cur.fetchall():
+                gid, guild_id, channel_id, message_id, prize, end_time, winners = row
+                _giveaways[gid] = {
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                    "prize": prize,
+                    "end_time": end_time,
+                    "winners": winners,
+                    "ended": False,
+                }
+    _giveaway_task = asyncio.create_task(_giveaway_loop())
+    logger.info(f"Giveaways loaded: {len(_giveaways)} active.")
 
-    for gid, ch, msg, prize, winners, end_time in rows:
-        asyncio.create_task(_schedule(max(0, end_time - now), gid, ch, msg, prize, winners))
 
-    logger.info(f"Giveaways loaded: {len(rows)} pending.")
-
-
-@plugin.command()
-@lightbulb.command("giveaway", "Manage giveaways.")
-@lightbulb.implements(lightbulb.SlashCommandGroup)
-async def giveaway(ctx: lightbulb.Context) -> None:
-    pass
+@loader.listener(hikari.StoppingEvent)
+async def on_stopping(event: hikari.StoppingEvent) -> None:
+    if _giveaway_task:
+        _giveaway_task.cancel()
 
 
-@giveaway.child
-@lightbulb.option("winners", "Number of winners.", type=int, default=1)
-@lightbulb.option("prize", "What's being given away.", type=str)
-@lightbulb.option("duration", "How long to run, e.g. 1h, 2d, 30m.", type=str)
-@lightbulb.command("start", "Start a giveaway.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def giveaway_start(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    seconds = _parse(ctx.options.duration)
-    if not seconds:
-        await ctx.respond("❌ Invalid duration. Use e.g. `1h`, `30m`, `2d`.")
-        return
+# /giveaway group
+giveaway_group = lightbulb.Group("giveaway", "Manage giveaways.")
 
-    prize = ctx.options.prize
-    winners = max(1, ctx.options.winners)
-    end_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
-    end_time = int(end_dt.timestamp())
 
-    embed = hikari.Embed(
-        title="🎉 Giveaway!",
-        description=f"**Prize:** {prize}\n\nReact with 🎉 to enter!\n\n"
-                    f"Duration: **{_fmt(seconds)}**\nWinners: **{winners}**",
-        color=0xFF73FA,
-    )
-    embed.timestamp = end_dt
-    embed.set_footer("Ends at")
+@giveaway_group.register
+class GiveawayStart(lightbulb.SlashCommand, name="start", description="Start a giveaway."):
+    prize = lightbulb.string("prize", "What are you giving away?")
+    duration = lightbulb.string("duration", "Duration (e.g. 1h, 30m, 2d).")
+    channel = lightbulb.channel("channel", "Channel for the giveaway.", default=None)
+    winners = lightbulb.integer("winners", "Number of winners.", default=1, min_value=1, max_value=20)
 
-    response = await ctx.respond(embed=embed)
-    message = await response.message()
-    await plugin.bot.rest.add_reaction(ctx.channel_id, message.id, GIVEAWAY_EMOJI)
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        secs = _parse_duration(self.duration)
+        if not secs:
+            await ctx.respond("❌ Invalid duration. Examples: `30m`, `2h`, `1d`.")
+            return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO giveaways (guild_id, channel_id, message_id, prize, winners, end_time) VALUES (?, ?, ?, ?, ?, ?)",
-            (ctx.guild_id, ctx.channel_id, message.id, prize, winners, end_time),
+        ch = self.channel or ctx.get_channel()
+        if ch is None:
+            await ctx.respond("❌ Could not determine the channel.")
+            return
+
+        end_time = datetime.datetime.now(datetime.timezone.utc).timestamp() + secs
+        end_dt = datetime.datetime.fromtimestamp(end_time, tz=datetime.timezone.utc)
+        end_str = f"<t:{int(end_time)}:R>"
+
+        embed = hikari.Embed(
+            title=f"🎁 {self.prize}",
+            description=f"React with {GIVEAWAY_EMOJI} to enter!\nEnds {end_str}\nWinners: **{self.winners}**",
+            color=0xFF69B4,
         )
-        giveaway_id = cur.lastrowid
-        await db.commit()
+        msg = await _rest.create_message(ch.id, embed=embed)
+        await _rest.add_reaction(ch.id, msg.id, GIVEAWAY_EMOJI)
 
-    asyncio.create_task(_schedule(seconds, giveaway_id, ctx.channel_id, message.id, prize, winners))
-    logger.info(f"Giveaway started by {ctx.author} in guild {ctx.guild_id}: {prize!r}")
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("""
+                INSERT INTO giveaways (guild_id, channel_id, message_id, prize, end_time, winners, ended)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+            """, (ctx.guild_id, ch.id, msg.id, self.prize, end_time, self.winners))
+            await db.commit()
+            giveaway_id = cur.lastrowid
 
-
-@giveaway.child
-@lightbulb.option("message_id", "ID of the giveaway message.", type=str)
-@lightbulb.command("end", "End a giveaway early and pick winners.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def giveaway_end(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    try:
-        message_id = int(ctx.options.message_id)
-    except ValueError:
-        await ctx.respond("❌ Invalid message ID.")
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, channel_id, prize, winners FROM giveaways WHERE message_id = ? AND ended = 0",
-            (message_id,),
-        ) as cur:
-            row = await cur.fetchone()
-
-    if not row:
-        await ctx.respond("❌ No active giveaway with that message ID.")
-        return
-
-    await ctx.respond("⏹️ Ending giveaway now...")
-    await _end_giveaway(row[0], row[1], message_id, row[2], row[3])
+        _giveaways[giveaway_id] = {
+            "guild_id": ctx.guild_id,
+            "channel_id": ch.id,
+            "message_id": msg.id,
+            "prize": self.prize,
+            "end_time": end_time,
+            "winners": self.winners,
+            "ended": False,
+        }
+        await ctx.respond(f"✅ Giveaway started in {ch.mention}!")
 
 
-@giveaway.child
-@lightbulb.option("message_id", "ID of the giveaway message.", type=str)
-@lightbulb.command("reroll", "Reroll the winner of a finished giveaway.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def giveaway_reroll(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    try:
-        message_id = int(ctx.options.message_id)
-    except ValueError:
-        await ctx.respond("❌ Invalid message ID.")
-        return
+@giveaway_group.register
+class GiveawayEnd(lightbulb.SlashCommand, name="end", description="End a giveaway early."):
+    message_id = lightbulb.string("message_id", "Message ID of the giveaway.")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT channel_id, winners FROM giveaways WHERE message_id = ?",
-            (message_id,),
-        ) as cur:
-            row = await cur.fetchone()
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        try:
+            mid = int(self.message_id)
+        except ValueError:
+            await ctx.respond("❌ Invalid message ID.")
+            return
 
-    if not row:
-        await ctx.respond("❌ No giveaway found with that message ID.")
-        return
+        target = next((gid for gid, d in _giveaways.items() if d["message_id"] == mid and not d["ended"]), None)
+        if target is None:
+            await ctx.respond("❌ No active giveaway with that message ID.")
+            return
 
-    winners = await _pick_winners(row[0], message_id, row[1])
-    if not winners:
-        await ctx.respond("❌ No valid entries to reroll from.")
-        return
-
-    mentions = ", ".join(f"<@{w}>" for w in winners)
-    await ctx.respond(f"🎉 Reroll! New winner{'s' if len(winners) > 1 else ''}: {mentions}")
+        await _end_giveaway(target)
+        await ctx.respond("✅ Giveaway ended.")
 
 
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("Giveaways extension loaded.")
+@giveaway_group.register
+class GiveawayReroll(lightbulb.SlashCommand, name="reroll", description="Reroll a giveaway winner."):
+    message_id = lightbulb.string("message_id", "Message ID of the ended giveaway.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        try:
+            mid = int(self.message_id)
+        except ValueError:
+            await ctx.respond("❌ Invalid message ID.")
+            return
+
+        data = next((d for d in _giveaways.values() if d["message_id"] == mid), None)
+        if data is None:
+            await ctx.respond("❌ Giveaway not found.")
+            return
+
+        channel_id = data["channel_id"]
+        try:
+            reactions = await _rest.fetch_reactions_for_emoji(channel_id, mid, GIVEAWAY_EMOJI)
+            participants = [u for u in reactions if not u.is_bot and u.id != _bot_id]
+        except Exception:
+            participants = []
+
+        if not participants:
+            await ctx.respond("❌ No participants found.")
+            return
+
+        winner = random.choice(participants)
+        await _rest.create_message(channel_id, f"🎉 New winner: {winner.mention}! Congratulations!")
+        await ctx.respond("✅ Rerolled.")
 
 
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("Giveaways extension unloaded.")
+loader.command(giveaway_group)

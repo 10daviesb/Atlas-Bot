@@ -3,48 +3,51 @@ import lightbulb
 import logging
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("Polls")
 
-NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+loader = lightbulb.Loader()
 
+_rest: hikari.api.RESTClient | None = None
 
-@plugin.command()
-@lightbulb.option("option4", "Fourth option (optional).", type=str, default=None)
-@lightbulb.option("option3", "Third option (optional).", type=str, default=None)
-@lightbulb.option("option2", "Second option.", type=str)
-@lightbulb.option("option1", "First option.", type=str)
-@lightbulb.option("question", "The poll question.", type=str)
-@lightbulb.command("poll", "Create a poll with up to 4 options.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def poll(ctx: lightbulb.Context) -> None:
-    options = [o for o in [
-        ctx.options.option1,
-        ctx.options.option2,
-        ctx.options.option3,
-        ctx.options.option4,
-    ] if o is not None]
-
-    lines = [f"**{ctx.options.question}**\n"]
-    for emoji, option in zip(NUMBER_EMOJIS, options):
-        lines.append(f"{emoji}  {option}")
-
-    embed = hikari.Embed(description="\n".join(lines), color=0x5865F2)
-    embed.set_footer(text=f"Poll by {ctx.author.username}")
-
-    response = await ctx.respond(embed=embed)
-    message = await response.message()
-
-    for emoji in NUMBER_EMOJIS[:len(options)]:
-        await plugin.bot.rest.add_reaction(ctx.channel_id, message.id, emoji)
-
-    logger.info(f"Poll created by {ctx.author} in guild {ctx.guild_id}: {ctx.options.question!r}")
+POLL_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
 
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("Polls extension loaded.")
+@loader.listener(hikari.StartedEvent)
+async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest
+    _rest = event.app.rest
 
 
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("Polls extension unloaded.")
+@loader.command
+class Poll(lightbulb.SlashCommand, name="poll", description="Create a poll."):
+    question = lightbulb.string("question", "The poll question.")
+    options = lightbulb.string("options", "Options separated by commas (2-10 options).")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        opts = [o.strip() for o in self.options.split(",") if o.strip()]
+        if len(opts) < 2:
+            await ctx.respond("❌ Please provide at least 2 options separated by commas.")
+            return
+        if len(opts) > 10:
+            await ctx.respond("❌ Maximum 10 options allowed.")
+            return
+
+        lines = "\n".join(f"{POLL_EMOJIS[i]} {opt}" for i, opt in enumerate(opts))
+        embed = hikari.Embed(
+            title=f"📊 {self.question}",
+            description=lines,
+            color=0x5865F2,
+        )
+        embed.set_footer(text=f"Poll by {ctx.user.username}")
+
+        await ctx.respond(embed=embed)
+        msg = await ctx.fetch_last_response()
+
+        if _rest is None:
+            return
+        for i in range(len(opts)):
+            try:
+                await _rest.add_reaction(ctx.channel_id, msg.id, POLL_EMOJIS[i])
+            except Exception as e:
+                logger.warning(f"Failed to add reaction: {e}")
+                break

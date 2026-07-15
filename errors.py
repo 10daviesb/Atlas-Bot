@@ -1,19 +1,16 @@
-import lightbulb
-
-
-class ExtensionDisabledError(lightbulb.CheckFailure):
+class ExtensionDisabledError(Exception):
     def __init__(self, extension: str) -> None:
-        super().__init__()
+        super().__init__(f"Extension '{extension}' is disabled.")
         self.extension = extension
 
 
-class CommandDisabledError(lightbulb.CheckFailure):
+class CommandDisabledError(Exception):
     def __init__(self, command: str) -> None:
-        super().__init__()
+        super().__init__(f"Command '{command}' is disabled.")
         self.command = command
 
 
-class MissingCommandRoleError(lightbulb.CheckFailure):
+class MissingCommandRoleError(Exception):
     def __init__(self, role_id: int) -> None:
-        super().__init__()
+        super().__init__(f"Missing role {role_id} to use this command.")
         self.role_id = role_id

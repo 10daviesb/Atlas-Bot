@@ -7,192 +7,158 @@ import lightbulb
 import logging
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("TempRoles")
+
+loader = lightbulb.Loader()
 
 DB_PATH = "atlas.db"
-
-_DURATION_RE = re.compile(
-    r"^(?:(\d+)\s*d(?:ays?)?)?\s*(?:(\d+)\s*h(?:ours?)?)?\s*"
-    r"(?:(\d+)\s*m(?:in(?:utes?)?)?)?\s*(?:(\d+)\s*s(?:ec(?:onds?)?)?)?$",
-    re.IGNORECASE,
-)
+_rest: hikari.api.RESTClient | None = None
+_check_task: asyncio.Task | None = None
 
 
-def _parse(text: str) -> int | None:
-    m = _DURATION_RE.match(text.strip())
-    if not m or not any(m.groups()):
+def _parse_duration(text: str) -> int | None:
+    m = re.fullmatch(r"(\d+)([smhd])", text.strip().lower())
+    if not m:
         return None
-    d, h, mi, s = (int(v) if v else 0 for v in m.groups())
-    total = d * 86400 + h * 3600 + mi * 60 + s
-    return total if total > 0 else None
+    val, unit = int(m.group(1)), m.group(2)
+    return val * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
 
 
-def _fmt(seconds: int) -> str:
-    parts = []
-    for unit, size in [("d", 86400), ("h", 3600), ("m", 60), ("s", 1)]:
-        if seconds >= size:
-            parts.append(f"{seconds // size}{unit}")
-            seconds %= size
-    return " ".join(parts) or "0s"
-
-
-def _now() -> int:
-    return int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-
-
-async def _remove_role(guild_id: int, user_id: int, role_id: int, row_id: int) -> None:
+async def _remove_role(guild_id: int, user_id: int, role_id: int) -> None:
+    if _rest is None:
+        return
     try:
-        await plugin.bot.rest.remove_role_from_member(guild_id, user_id, role_id)
-        logger.info(f"Removed temp role {role_id} from {user_id} in guild {guild_id}")
+        await _rest.remove_role_from_member(guild_id, user_id, role_id, reason="TempRole expired")
     except Exception as e:
-        logger.warning(f"Failed to remove temp role {role_id} from {user_id}: {e}")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM temp_roles WHERE id = ?", (row_id,))
-        await db.commit()
+        logger.warning(f"TempRole removal failed: {e}")
 
 
-async def _schedule(delay: int, guild_id: int, user_id: int, role_id: int, row_id: int) -> None:
-    await asyncio.sleep(delay)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id FROM temp_roles WHERE id = ?", (row_id,)) as cur:
-            if not await cur.fetchone():
-                return
-    await _remove_role(guild_id, user_id, role_id, row_id)
+async def _check_loop() -> None:
+    while True:
+        await asyncio.sleep(30)
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT id, guild_id, user_id, role_id FROM temproles WHERE expires_at <= ?",
+                (now,)
+            ) as cur:
+                due = await cur.fetchall()
+            for rid, guild_id, user_id, role_id in due:
+                await _remove_role(guild_id, user_id, role_id)
+                await db.execute("DELETE FROM temproles WHERE id = ?", (rid,))
+            if due:
+                await db.commit()
 
 
-@plugin.listener(hikari.StartedEvent)
+@loader.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest, _check_task
+    _rest = event.app.rest
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS temp_roles (
+            CREATE TABLE IF NOT EXISTS temproles (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id   INTEGER NOT NULL,
                 user_id    INTEGER NOT NULL,
                 role_id    INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
+                expires_at REAL    NOT NULL
             )
         """)
         await db.commit()
-        now = _now()
-        async with db.execute(
-            "SELECT id, guild_id, user_id, role_id, expires_at FROM temp_roles"
-        ) as cur:
-            rows = await cur.fetchall()
-
-    expired, pending = [], []
-    for row in rows:
-        (expired if row[4] <= now else pending).append(row)
-
-    for row_id, guild_id, user_id, role_id, _ in expired:
-        asyncio.create_task(_remove_role(guild_id, user_id, role_id, row_id))
-
-    for row_id, guild_id, user_id, role_id, expires_at in pending:
-        asyncio.create_task(_schedule(expires_at - now, guild_id, user_id, role_id, row_id))
-
-    logger.info(f"TempRoles loaded: {len(pending)} pending, {len(expired)} expired.")
+    _check_task = asyncio.create_task(_check_loop())
+    logger.info("TempRoles loaded.")
 
 
-@plugin.command()
-@lightbulb.command("temprole", "Manage temporary roles.")
-@lightbulb.implements(lightbulb.SlashCommandGroup)
-async def temprole(ctx: lightbulb.Context) -> None:
-    pass
+@loader.listener(hikari.StoppingEvent)
+async def on_stopping(event: hikari.StoppingEvent) -> None:
+    if _check_task:
+        _check_task.cancel()
 
 
-@temprole.child
-@lightbulb.option("duration", "How long to give the role, e.g. 1h, 30m, 2d.", type=str)
-@lightbulb.option("role", "Role to assign temporarily.", type=hikari.Role)
-@lightbulb.option("member", "Member to give the role to.", type=hikari.Member)
-@lightbulb.command("give", "Temporarily assign a role to a member.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def temprole_give(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_ROLES:
-        await ctx.respond("❌ You need the **Manage Roles** permission.")
-        return
-    seconds = _parse(ctx.options.duration)
-    if not seconds:
-        await ctx.respond("❌ Invalid duration. Try `1h`, `30m`, or `2d`.")
-        return
-    member: hikari.Member = ctx.options.member
-    role: hikari.Role = ctx.options.role
-    expires_at = _now() + seconds
-
-    try:
-        await plugin.bot.rest.add_role_to_member(ctx.guild_id, member, role)
-    except Exception as e:
-        await ctx.respond(f"❌ Could not assign role: {e}")
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO temp_roles (guild_id, user_id, role_id, expires_at) VALUES (?, ?, ?, ?)",
-            (ctx.guild_id, member.id, role.id, expires_at),
-        )
-        row_id = cur.lastrowid
-        await db.commit()
-
-    asyncio.create_task(_schedule(seconds, ctx.guild_id, member.id, role.id, row_id))
-    await ctx.respond(f"✅ {role.mention} given to {member.mention} for **{_fmt(seconds)}**.")
+# /temprole group
+temprole_group = lightbulb.Group("temprole", "Manage temporary roles.")
 
 
-@temprole.child
-@lightbulb.option("role", "Role to remove.", type=hikari.Role)
-@lightbulb.option("member", "Member to remove the role from.", type=hikari.Member)
-@lightbulb.command("revoke", "Remove a temporary role immediately.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def temprole_revoke(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_ROLES:
-        await ctx.respond("❌ You need the **Manage Roles** permission.")
-        return
-    member: hikari.Member = ctx.options.member
-    role: hikari.Role = ctx.options.role
+@temprole_group.register
+class TempRoleAdd(lightbulb.SlashCommand, name="add", description="Give a user a temporary role."):
+    user = lightbulb.user("user", "User to give the role to.")
+    role = lightbulb.role("role", "Role to give.")
+    duration = lightbulb.string("duration", "Duration (e.g. 1h, 30m, 2d).")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id FROM temp_roles WHERE guild_id = ? AND user_id = ? AND role_id = ?",
-            (ctx.guild_id, member.id, role.id),
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
-            await ctx.respond("❌ No active temp role entry found for that member and role.")
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_ROLES):
+            await ctx.respond("❌ You need the **Manage Roles** permission.")
             return
-        await db.execute("DELETE FROM temp_roles WHERE id = ?", (row[0],))
-        await db.commit()
 
-    try:
-        await plugin.bot.rest.remove_role_from_member(ctx.guild_id, member, role)
-    except Exception as e:
-        await ctx.respond(f"❌ Could not remove role: {e}")
-        return
-    await ctx.respond(f"✅ Removed {role.mention} from {member.mention}.")
+        secs = _parse_duration(self.duration)
+        if not secs:
+            await ctx.respond("❌ Invalid duration. Examples: `30m`, `2h`, `1d`.")
+            return
 
+        target = self.user
+        role = self.role
+        expires_at = datetime.datetime.now(datetime.timezone.utc).timestamp() + secs
 
-@temprole.child
-@lightbulb.command("list", "List active temporary roles in this server.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def temprole_list(ctx: lightbulb.Context) -> None:
-    now = _now()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id, role_id, expires_at FROM temp_roles WHERE guild_id = ? ORDER BY expires_at",
-            (ctx.guild_id,),
-        ) as cur:
-            rows = await cur.fetchall()
-    if not rows:
-        await ctx.respond("No active temporary roles.")
-        return
-    lines = ["**Active Temporary Roles**"]
-    for user_id, role_id, expires_at in rows:
-        remaining = _fmt(max(0, expires_at - now))
-        lines.append(f"<@{user_id}> — <@&{role_id}> — expires in **{remaining}**")
-    await ctx.respond("\n".join(lines))
+        try:
+            await ctx.client.rest.add_role_to_member(ctx.guild_id, target.id, role.id, reason="TempRole assigned")
+        except hikari.ForbiddenError:
+            await ctx.respond("❌ I don't have permission to assign that role.")
+            return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO temproles (guild_id, user_id, role_id, expires_at) VALUES (?, ?, ?, ?)
+            """, (ctx.guild_id, target.id, role.id, expires_at))
+            await db.commit()
+
+        await ctx.respond(
+            f"✅ Gave {role.mention} to {target.mention} for **{self.duration}**. "
+            f"Expires <t:{int(expires_at)}:R>."
+        )
 
 
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("TempRoles extension loaded.")
+@temprole_group.register
+class TempRoleRemove(lightbulb.SlashCommand, name="remove", description="Remove a temporary role immediately."):
+    user = lightbulb.user("user", "User to remove the role from.")
+    role = lightbulb.role("role", "Role to remove.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_ROLES):
+            await ctx.respond("❌ You need the **Manage Roles** permission.")
+            return
+
+        target = self.user
+        role = self.role
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "DELETE FROM temproles WHERE guild_id = ? AND user_id = ? AND role_id = ?",
+                (ctx.guild_id, target.id, role.id)
+            )
+            await db.commit()
+
+        await _remove_role(ctx.guild_id, target.id, role.id)
+        await ctx.respond(f"✅ Removed {role.mention} from {target.mention}.")
 
 
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("TempRoles extension unloaded.")
+@temprole_group.register
+class TempRoleList(lightbulb.SlashCommand, name="list", description="List all active temporary roles."):
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT user_id, role_id, expires_at FROM temproles WHERE guild_id = ? ORDER BY expires_at",
+                (ctx.guild_id,)
+            ) as cur:
+                rows = await cur.fetchall()
+
+        if not rows:
+            await ctx.respond("ℹ️ No active temporary roles.")
+            return
+
+        lines = [f"<@{uid}> → <@&{rid}> — expires <t:{int(exp)}:R>" for uid, rid, exp in rows[:20]]
+        await ctx.respond("**Active Temporary Roles:**\n" + "\n".join(lines))
+
+
+loader.command(temprole_group)

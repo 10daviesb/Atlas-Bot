@@ -4,218 +4,173 @@ import aiosqlite
 import hikari
 import lightbulb
 import logging
-from config import config
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("StreamNotify")
+
+loader = lightbulb.Loader()
 
 DB_PATH = "atlas.db"
-POLL_INTERVAL = 300  # 5 minutes
+_rest: hikari.api.RESTClient | None = None
 
-# guild_id -> list of {username, channel_id}
-_trackers: dict[int, list[dict]] = {}
-# username -> bool (currently live)
-_live_state: dict[str, bool] = {}
-_twitch_token: str | None = None
+# guild_id -> {channel_id, streamers: [name], live_cache: {name: bool}}
+_stream_config: dict[int, dict] = {}
+_poll_task: asyncio.Task | None = None
+
+CHECK_INTERVAL = 120  # seconds
 
 
-async def _get_twitch_token(session: aiohttp.ClientSession) -> str | None:
-    if not config.TWITCH_CLIENT_ID or not config.TWITCH_CLIENT_SECRET:
-        return None
+async def _check_twitch(streamer: str) -> bool:
+    """Simple check using Twitch's unofficial API. Returns True if live."""
     try:
-        async with session.post(
-            "https://id.twitch.tv/oauth2/token",
-            params={
-                "client_id": config.TWITCH_CLIENT_ID,
-                "client_secret": config.TWITCH_CLIENT_SECRET,
-                "grant_type": "client_credentials",
-            },
-        ) as resp:
-            data = await resp.json()
-            return data.get("access_token")
-    except Exception as e:
-        logger.warning(f"Twitch token fetch failed: {e}")
-        return None
-
-
-async def _check_streams() -> None:
-    if not config.TWITCH_CLIENT_ID or not config.TWITCH_CLIENT_SECRET:
-        return
-    global _twitch_token
-    async with aiohttp.ClientSession() as session:
-        if not _twitch_token:
-            _twitch_token = await _get_twitch_token(session)
-        if not _twitch_token:
-            return
-
-        all_usernames: set[str] = set()
-        for trackers in _trackers.values():
-            for t in trackers:
-                all_usernames.add(t["username"].lower())
-
-        if not all_usernames:
-            return
-
-        headers = {
-            "Client-ID": config.TWITCH_CLIENT_ID,
-            "Authorization": f"Bearer {_twitch_token}",
-        }
-        params = [("user_login", u) for u in all_usernames]
-        try:
+        async with aiohttp.ClientSession() as session:
             async with session.get(
-                "https://api.twitch.tv/helix/streams",
-                headers=headers,
-                params=params,
+                f"https://www.twitch.tv/{streamer}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
-                if resp.status == 401:
-                    _twitch_token = await _get_twitch_token(session)
-                    return
-                data = await resp.json()
-        except Exception as e:
-            logger.warning(f"Twitch stream check failed: {e}")
-            return
-
-        live_now: set[str] = {s["user_login"].lower() for s in data.get("data", [])}
-        stream_info: dict[str, dict] = {s["user_login"].lower(): s for s in data.get("data", [])}
-
-        for username in all_usernames:
-            was_live = _live_state.get(username, False)
-            is_live = username in live_now
-            _live_state[username] = is_live
-
-            if is_live and not was_live:
-                info = stream_info[username]
-                for guild_id, trackers in _trackers.items():
-                    for t in trackers:
-                        if t["username"].lower() == username:
-                            embed = hikari.Embed(
-                                title=f"🔴 {info['user_name']} is live!",
-                                description=info.get("title", "No title"),
-                                color=0x9146FF,
-                                url=f"https://twitch.tv/{username}",
-                            )
-                            embed.add_field("Game", info.get("game_name") or "Unknown", inline=True)
-                            embed.add_field("Viewers", str(info.get("viewer_count", 0)), inline=True)
-                            try:
-                                await plugin.bot.rest.create_message(t["channel_id"], embed=embed)
-                            except Exception as e:
-                                logger.warning(f"Stream notify failed: {e}")
+                if resp.status != 200:
+                    return False
+                text = await resp.text()
+                return '"isLiveBroadcast":true' in text or '"isLiveBroadcast": true' in text
+    except Exception:
+        return False
 
 
 async def _poll_loop() -> None:
-    await asyncio.sleep(10)
     while True:
-        await _check_streams()
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(CHECK_INTERVAL)
+        if _rest is None:
+            continue
+        for guild_id, cfg in list(_stream_config.items()):
+            channel_id = cfg["channel_id"]
+            for streamer in cfg.get("streamers", []):
+                was_live = cfg["live_cache"].get(streamer, False)
+                is_live = await _check_twitch(streamer)
+                cfg["live_cache"][streamer] = is_live
+                if is_live and not was_live:
+                    try:
+                        await _rest.create_message(
+                            channel_id,
+                            f"🔴 **{streamer}** is now live on Twitch! https://twitch.tv/{streamer}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Stream notify failed: {e}")
 
 
-@plugin.listener(hikari.StartedEvent)
+@loader.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest, _poll_task
+    _rest = event.app.rest
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS stream_trackers (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id   INTEGER NOT NULL,
-                username   TEXT    NOT NULL,
-                channel_id INTEGER NOT NULL,
-                UNIQUE(guild_id, username)
+            CREATE TABLE IF NOT EXISTS stream_config (
+                guild_id   INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS stream_streamers (
+                guild_id INTEGER NOT NULL,
+                streamer TEXT    NOT NULL,
+                PRIMARY KEY (guild_id, streamer)
             )
         """)
         await db.commit()
-        async with db.execute("SELECT guild_id, username, channel_id FROM stream_trackers") as cur:
-            for guild_id, username, channel_id in await cur.fetchall():
-                _trackers.setdefault(guild_id, []).append(
-                    {"username": username, "channel_id": channel_id}
-                )
-
-    if config.TWITCH_CLIENT_ID and config.TWITCH_CLIENT_SECRET:
-        asyncio.create_task(_poll_loop())
-        logger.info("StreamNotify polling started.")
-    else:
-        logger.info("StreamNotify: TWITCH_CLIENT_ID/SECRET not set — polling disabled.")
+        async with db.execute("SELECT guild_id, channel_id FROM stream_config") as cur:
+            for guild_id, channel_id in await cur.fetchall():
+                _stream_config[guild_id] = {"channel_id": channel_id, "streamers": [], "live_cache": {}}
+        async with db.execute("SELECT guild_id, streamer FROM stream_streamers") as cur:
+            for guild_id, streamer in await cur.fetchall():
+                if guild_id in _stream_config:
+                    _stream_config[guild_id]["streamers"].append(streamer)
+    _poll_task = asyncio.create_task(_poll_loop())
+    logger.info("StreamNotify loaded.")
 
 
-@plugin.command()
-@lightbulb.command("stream", "Manage stream live notifications.")
-@lightbulb.implements(lightbulb.SlashCommandGroup)
-async def stream(ctx: lightbulb.Context) -> None:
-    pass
+@loader.listener(hikari.StoppingEvent)
+async def on_stopping(event: hikari.StoppingEvent) -> None:
+    if _poll_task:
+        _poll_task.cancel()
 
 
-@stream.child
-@lightbulb.option("channel", "Channel to post notifications in.", type=hikari.TextableGuildChannel, default=None)
-@lightbulb.option("username", "Twitch username to track.", type=str)
-@lightbulb.command("add", "Track a Twitch streamer.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def stream_add(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    if not config.TWITCH_CLIENT_ID or not config.TWITCH_CLIENT_SECRET:
-        await ctx.respond("❌ Twitch API credentials not configured. Set `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` in `.env`.")
-        return
-    username: str = ctx.options.username.lower().strip()
-    notify_channel = ctx.options.channel or ctx.get_channel()
-    channel_id = notify_channel.id
-
-    guild_trackers = _trackers.setdefault(ctx.guild_id, [])
-    if any(t["username"] == username for t in guild_trackers):
-        await ctx.respond(f"❌ Already tracking **{username}**.")
-        return
-    guild_trackers.append({"username": username, "channel_id": channel_id})
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO stream_trackers (guild_id, username, channel_id) VALUES (?, ?, ?)",
-            (ctx.guild_id, username, channel_id),
-        )
-        await db.commit()
-    await ctx.respond(f"✅ Now tracking **{username}** on Twitch. Notifications → <#{channel_id}>.")
+# /stream group
+stream_group = lightbulb.Group("stream", "Manage stream notifications.")
 
 
-@stream.child
-@lightbulb.option("username", "Twitch username to stop tracking.", type=str)
-@lightbulb.command("remove", "Stop tracking a Twitch streamer.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def stream_remove(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    username = ctx.options.username.lower().strip()
-    guild_trackers = _trackers.get(ctx.guild_id, [])
-    before = len(guild_trackers)
-    _trackers[ctx.guild_id] = [t for t in guild_trackers if t["username"] != username]
-    if len(_trackers[ctx.guild_id]) == before:
-        await ctx.respond(f"❌ Not tracking **{username}**.")
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM stream_trackers WHERE guild_id = ? AND username = ?",
-            (ctx.guild_id, username),
-        )
-        await db.commit()
-    await ctx.respond(f"✅ Stopped tracking **{username}**.")
+@stream_group.register
+class StreamSetChannel(lightbulb.SlashCommand, name="setchannel", description="Set the notification channel."):
+    channel = lightbulb.channel("channel", "Channel for live notifications.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        ch = self.channel
+        cfg = _stream_config.setdefault(ctx.guild_id, {"channel_id": ch.id, "streamers": [], "live_cache": {}})
+        cfg["channel_id"] = ch.id
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO stream_config (guild_id, channel_id) VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id
+            """, (ctx.guild_id, ch.id))
+            await db.commit()
+        await ctx.respond(f"✅ Stream notifications will be sent to {ch.mention}.")
 
 
-@stream.child
-@lightbulb.command("list", "List tracked streamers in this server.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def stream_list(ctx: lightbulb.Context) -> None:
-    trackers = _trackers.get(ctx.guild_id, [])
-    if not trackers:
-        await ctx.respond("No streamers being tracked.")
-        return
-    lines = ["**Tracked Streamers**"]
-    for t in trackers:
-        status = "🔴 LIVE" if _live_state.get(t["username"]) else "⚫ offline"
-        lines.append(f"**{t['username']}** — {status} → <#{t['channel_id']}>")
-    await ctx.respond("\n".join(lines))
+@stream_group.register
+class StreamAdd(lightbulb.SlashCommand, name="add", description="Add a Twitch streamer to monitor."):
+    streamer = lightbulb.string("streamer", "Twitch username.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        if ctx.guild_id not in _stream_config:
+            await ctx.respond("❌ Please set a notification channel first with `/stream setchannel`.")
+            return
+        name = self.streamer.lower().strip()
+        cfg = _stream_config[ctx.guild_id]
+        if name in cfg["streamers"]:
+            await ctx.respond(f"⚠️ **{name}** is already being monitored.")
+            return
+        cfg["streamers"].append(name)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR IGNORE INTO stream_streamers (guild_id, streamer) VALUES (?, ?)", (ctx.guild_id, name))
+            await db.commit()
+        await ctx.respond(f"✅ Now monitoring **{name}** on Twitch.")
 
 
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("StreamNotify extension loaded.")
+@stream_group.register
+class StreamRemove(lightbulb.SlashCommand, name="remove", description="Remove a streamer from monitoring."):
+    streamer = lightbulb.string("streamer", "Twitch username.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        name = self.streamer.lower().strip()
+        cfg = _stream_config.get(ctx.guild_id)
+        if cfg and name in cfg["streamers"]:
+            cfg["streamers"].remove(name)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM stream_streamers WHERE guild_id = ? AND streamer = ?", (ctx.guild_id, name))
+            await db.commit()
+        await ctx.respond(f"✅ Stopped monitoring **{name}**.")
 
 
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("StreamNotify extension unloaded.")
+@stream_group.register
+class StreamList(lightbulb.SlashCommand, name="list", description="List monitored streamers."):
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        cfg = _stream_config.get(ctx.guild_id)
+        if not cfg or not cfg["streamers"]:
+            await ctx.respond("ℹ️ No streamers being monitored.")
+            return
+        lines = [f"• **{s}**" for s in cfg["streamers"]]
+        await ctx.respond("**Monitored Streamers:**\n" + "\n".join(lines))
+
+
+loader.command(stream_group)

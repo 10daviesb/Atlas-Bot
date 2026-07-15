@@ -1,66 +1,122 @@
 import hikari
 import lightbulb
 import logging
+import aiosqlite
 from config import config
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("Welcome")
 
-# In-memory store: guild_id -> channel_id
-# A real deployment would persist this in a DB (config.DB_URI)
-_welcome_channels: dict[int, int] = {}
+loader = lightbulb.Loader(should_load_hook=lambda: getattr(config, "ENABLE_WELCOME_MESSAGES", True))
+
+DB_PATH = "atlas.db"
+_rest: hikari.api.RESTClient | None = None
+
+# guild_id -> {channel_id, message}
+_welcome_config: dict[int, dict] = {}
+
+DEFAULT_MESSAGE = "Welcome to the server, {mention}! 🎉"
 
 
-@plugin.listener(hikari.MemberCreateEvent)
+@loader.listener(hikari.StartedEvent)
+async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest
+    _rest = event.app.rest
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS welcome_config (
+                guild_id   INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                message    TEXT    NOT NULL
+            )
+        """)
+        await db.commit()
+        async with db.execute("SELECT guild_id, channel_id, message FROM welcome_config") as cur:
+            for guild_id, channel_id, message in await cur.fetchall():
+                _welcome_config[guild_id] = {"channel_id": channel_id, "message": message}
+    logger.info(f"Welcome loaded for {len(_welcome_config)} guilds.")
+
+
+@loader.listener(hikari.MemberCreateEvent)
 async def on_member_join(event: hikari.MemberCreateEvent) -> None:
-    channel_id = _welcome_channels.get(event.guild_id)
-    if not channel_id:
+    cfg = _welcome_config.get(event.guild_id)
+    if not cfg or _rest is None:
         return
-    member = event.member
+
+    message_template = cfg["message"]
     try:
-        await plugin.bot.rest.create_message(
-            channel_id,
-            f"👋 Welcome to the server, {member.mention}! We're glad to have you here.",
-        )
-        logger.info(f"Sent welcome message for {member} in guild {event.guild_id}")
+        guild = await _rest.fetch_guild(event.guild_id)
+        guild_name = guild.name
+    except Exception:
+        guild_name = "the server"
+
+    message = message_template.format(
+        mention=event.member.mention,
+        username=event.member.username,
+        display_name=event.member.display_name,
+        guild=guild_name,
+        member_count=getattr(guild, "member_count", "?") if "guild" in dir() else "?",
+    )
+
+    try:
+        await _rest.create_message(cfg["channel_id"], message)
     except Exception as e:
-        logger.warning(f"Failed to send welcome message: {e}")
+        logger.warning(f"Welcome message failed: {e}")
 
 
-@plugin.command()
-@lightbulb.option("channel", "The channel to send welcome messages in.", type=hikari.TextableGuildChannel)
-@lightbulb.command("setwelcome", "Set the channel for welcome messages.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def set_welcome(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission to use this command.")
-        return
-    channel = ctx.options.channel
-    _welcome_channels[ctx.guild_id] = channel.id
-    await ctx.respond(f"✅ Welcome messages will be sent in {channel.mention}.")
-    logger.info(f"{ctx.author} set welcome channel to #{channel.name} in guild {ctx.guild_id}")
+@loader.command
+class SetWelcome(
+    lightbulb.SlashCommand,
+    name="setwelcome",
+    description="Set up the welcome message.",
+):
+    channel = lightbulb.channel("channel", "Channel to send welcome messages in.")
+    message = lightbulb.string(
+        "message",
+        "Welcome message. Use {mention}, {username}, {guild}, {member_count}.",
+        default=DEFAULT_MESSAGE,
+    )
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+
+        ch = self.channel
+        msg = self.message
+        _welcome_config[ctx.guild_id] = {"channel_id": ch.id, "message": msg}
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO welcome_config (guild_id, channel_id, message) VALUES (?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id, message = excluded.message
+            """, (ctx.guild_id, ch.id, msg))
+            await db.commit()
+
+        preview = msg.format(
+            mention=ctx.user.mention,
+            username=ctx.user.username,
+            display_name=ctx.user.username,
+            guild="This Server",
+            member_count="?",
+        )
+        await ctx.respond(f"✅ Welcome message set to channel {ch.mention}.\n**Preview:**\n{preview}")
 
 
-@plugin.command()
-@lightbulb.command("clearwelcome", "Disable welcome messages for this server.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def clear_welcome(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission to use this command.")
-        return
-    _welcome_channels.pop(ctx.guild_id, None)
-    await ctx.respond("✅ Welcome messages have been disabled.")
-    logger.info(f"{ctx.author} disabled welcome messages in guild {ctx.guild_id}")
+@loader.command
+class ClearWelcome(
+    lightbulb.SlashCommand,
+    name="clearwelcome",
+    description="Remove the welcome message configuration.",
+):
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
 
-
-def load(bot):
-    if config.ENABLE_WELCOME_MESSAGES:
-        bot.add_plugin(plugin)
-        logger.info("Welcome extension loaded.")
-    else:
-        logger.info("Welcome extension skipped (ENABLE_WELCOME_MESSAGES=False).")
-
-
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("Welcome extension unloaded.")
+        _welcome_config.pop(ctx.guild_id, None)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM welcome_config WHERE guild_id = ?", (ctx.guild_id,))
+            await db.commit()
+        await ctx.respond("✅ Welcome message removed.")

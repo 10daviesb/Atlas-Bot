@@ -4,14 +4,18 @@ import lightbulb
 import logging
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("AuditLog")
+
+loader = lightbulb.Loader()
 
 DB_PATH = "atlas.db"
 _log_channels: dict[int, int] = {}
+_rest: hikari.api.RESTClient | None = None
 
 
-@plugin.listener(hikari.StartedEvent)
+@loader.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest
+    _rest = event.app.rest
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS auditlog_config (
@@ -28,35 +32,35 @@ async def on_started(event: hikari.StartedEvent) -> None:
 
 async def _log(guild_id: int, content: str) -> None:
     channel_id = _log_channels.get(guild_id)
-    if not channel_id:
+    if not channel_id or _rest is None:
         return
     try:
-        await plugin.bot.rest.create_message(channel_id, content)
+        await _rest.create_message(channel_id, content)
     except Exception as e:
         logger.warning(f"AuditLog post failed: {e}")
 
 
-@plugin.listener(hikari.MemberCreateEvent)
+@loader.listener(hikari.MemberCreateEvent)
 async def on_join(event: hikari.MemberCreateEvent) -> None:
     await _log(event.guild_id, f"📥 **{event.member}** joined the server.")
 
 
-@plugin.listener(hikari.MemberDeleteEvent)
+@loader.listener(hikari.MemberDeleteEvent)
 async def on_leave(event: hikari.MemberDeleteEvent) -> None:
     await _log(event.guild_id, f"📤 **{event.user}** left the server.")
 
 
-@plugin.listener(hikari.BanCreateEvent)
+@loader.listener(hikari.BanCreateEvent)
 async def on_ban(event: hikari.BanCreateEvent) -> None:
     await _log(event.guild_id, f"🔨 **{event.user}** was banned.")
 
 
-@plugin.listener(hikari.BanDeleteEvent)
+@loader.listener(hikari.BanDeleteEvent)
 async def on_unban(event: hikari.BanDeleteEvent) -> None:
     await _log(event.guild_id, f"✅ **{event.user}** was unbanned.")
 
 
-@plugin.listener(hikari.GuildMessageDeleteEvent)
+@loader.listener(hikari.GuildMessageDeleteEvent)
 async def on_delete(event: hikari.GuildMessageDeleteEvent) -> None:
     msg = event.old_message
     if msg and not msg.author.is_bot:
@@ -64,7 +68,7 @@ async def on_delete(event: hikari.GuildMessageDeleteEvent) -> None:
         await _log(event.guild_id, f"🗑️ Message by **{msg.author}** deleted in <#{event.channel_id}>:\n> {content}")
 
 
-@plugin.listener(hikari.GuildMessageUpdateEvent)
+@loader.listener(hikari.GuildMessageUpdateEvent)
 async def on_edit(event: hikari.GuildMessageUpdateEvent) -> None:
     if not event.old_message or not event.author or event.author.is_bot:
         return
@@ -78,7 +82,7 @@ async def on_edit(event: hikari.GuildMessageUpdateEvent) -> None:
         )
 
 
-@plugin.listener(hikari.MemberUpdateEvent)
+@loader.listener(hikari.MemberUpdateEvent)
 async def on_member_update(event: hikari.MemberUpdateEvent) -> None:
     old, new = event.old_member, event.member
     if not old or not new:
@@ -98,51 +102,44 @@ async def on_member_update(event: hikari.MemberUpdateEvent) -> None:
         )
 
 
-@plugin.command()
-@lightbulb.command("auditlog", "Manage the audit log.")
-@lightbulb.implements(lightbulb.SlashCommandGroup)
-async def auditlog(ctx: lightbulb.Context) -> None:
-    pass
+# /auditlog group
+auditlog_group = lightbulb.Group("auditlog", "Manage the audit log.")
 
 
-@auditlog.child
-@lightbulb.option("channel", "Channel for audit logs.", type=hikari.TextableGuildChannel)
-@lightbulb.command("set", "Set the audit log channel.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def auditlog_set(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    channel = ctx.options.channel
-    _log_channels[ctx.guild_id] = channel.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO auditlog_config (guild_id, channel_id) VALUES (?, ?)
-            ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id
-        """, (ctx.guild_id, channel.id))
-        await db.commit()
-    await ctx.respond(f"✅ Audit logs will be sent to {channel.mention}.")
+@loader.command
+@auditlog_group.register
+class AuditLogSet(lightbulb.SlashCommand, name="set", description="Set the audit log channel."):
+    channel = lightbulb.channel("channel", "Channel for audit logs.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        channel = self.channel
+        _log_channels[ctx.guild_id] = channel.id
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO auditlog_config (guild_id, channel_id) VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id
+            """, (ctx.guild_id, channel.id))
+            await db.commit()
+        await ctx.respond(f"✅ Audit logs will be sent to {channel.mention}.")
 
 
-@auditlog.child
-@lightbulb.command("disable", "Disable the audit log.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def auditlog_disable(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    _log_channels.pop(ctx.guild_id, None)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM auditlog_config WHERE guild_id = ?", (ctx.guild_id,))
-        await db.commit()
-    await ctx.respond("✅ Audit logging disabled.")
+@loader.command
+@auditlog_group.register
+class AuditLogDisable(lightbulb.SlashCommand, name="disable", description="Disable the audit log."):
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        _log_channels.pop(ctx.guild_id, None)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM auditlog_config WHERE guild_id = ?", (ctx.guild_id,))
+            await db.commit()
+        await ctx.respond("✅ Audit logging disabled.")
 
 
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("AuditLog extension loaded.")
-
-
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("AuditLog extension unloaded.")
+loader.command(auditlog_group)

@@ -4,143 +4,173 @@ import lightbulb
 import logging
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("Verification")
+
+loader = lightbulb.Loader()
 
 DB_PATH = "atlas.db"
-VERIFY_BUTTON_ID = "atlas_verify"
+_rest: hikari.api.RESTClient | None = None
+_bot_id: int | None = None
 
-# guild_id -> {unverified_role_id, verified_role_id}
-_configs: dict[int, dict] = {}
+# guild_id -> {role_id, channel_id, message_id, button_label}
+_verify_config: dict[int, dict] = {}
+
+VERIFY_CUSTOM_ID = "atlas_verify_button"
 
 
-@plugin.listener(hikari.StartedEvent)
+@loader.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest, _bot_id
+    _rest = event.app.rest
+    me = await _rest.fetch_my_user()
+    _bot_id = me.id
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS verification_config (
-                guild_id           INTEGER PRIMARY KEY,
-                unverified_role_id INTEGER,
-                verified_role_id   INTEGER NOT NULL
+                guild_id     INTEGER PRIMARY KEY,
+                role_id      INTEGER NOT NULL,
+                channel_id   INTEGER,
+                message_id   INTEGER,
+                button_label TEXT NOT NULL DEFAULT 'Verify'
             )
         """)
         await db.commit()
-        async with db.execute(
-            "SELECT guild_id, unverified_role_id, verified_role_id FROM verification_config"
-        ) as cur:
-            for guild_id, unverified, verified in await cur.fetchall():
-                _configs[guild_id] = {"unverified": unverified, "verified": verified}
-    logger.info("Verification DB initialized.")
+        async with db.execute("SELECT guild_id, role_id, channel_id, message_id, button_label FROM verification_config") as cur:
+            for guild_id, role_id, channel_id, message_id, button_label in await cur.fetchall():
+                _verify_config[guild_id] = {
+                    "role_id": role_id,
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                    "button_label": button_label,
+                }
+    logger.info("Verification loaded.")
 
 
-@plugin.listener(hikari.InteractionCreateEvent)
+@loader.listener(hikari.InteractionCreateEvent)
 async def on_interaction(event: hikari.InteractionCreateEvent) -> None:
     if not isinstance(event.interaction, hikari.ComponentInteraction):
         return
-    if event.interaction.custom_id != VERIFY_BUTTON_ID:
+    if event.interaction.custom_id != VERIFY_CUSTOM_ID:
+        return
+    if _rest is None:
         return
 
     guild_id = event.interaction.guild_id
-    user_id = event.interaction.user.id
-    cfg = _configs.get(guild_id)
+    if not guild_id:
+        return
 
+    cfg = _verify_config.get(guild_id)
     if not cfg:
         await event.interaction.create_initial_response(
             hikari.ResponseType.MESSAGE_CREATE,
-            content="❌ Verification is not configured for this server.",
+            "❌ Verification is not configured.",
             flags=hikari.MessageFlag.EPHEMERAL,
         )
         return
+
+    user_id = event.interaction.user.id
+    role_id = cfg["role_id"]
 
     try:
-        if cfg.get("unverified"):
-            await plugin.bot.rest.remove_role_from_member(guild_id, user_id, cfg["unverified"])
-        await plugin.bot.rest.add_role_to_member(guild_id, user_id, cfg["verified"])
-    except Exception as e:
-        logger.warning(f"Verification role update failed for {user_id} in {guild_id}: {e}")
+        await _rest.add_role_to_member(guild_id, user_id, role_id, reason="Verification")
         await event.interaction.create_initial_response(
             hikari.ResponseType.MESSAGE_CREATE,
-            content="❌ Could not assign verified role. Please contact an admin.",
+            "✅ You have been verified!",
             flags=hikari.MessageFlag.EPHEMERAL,
         )
-        return
-
-    await event.interaction.create_initial_response(
-        hikari.ResponseType.MESSAGE_CREATE,
-        content="✅ You've been verified! Welcome to the server.",
-        flags=hikari.MessageFlag.EPHEMERAL,
-    )
-    logger.info(f"User {user_id} verified in guild {guild_id}")
-
-
-@plugin.command()
-@lightbulb.option(
-    "unverified_role",
-    "Role to remove on verify (optional).",
-    type=hikari.Role,
-    default=None,
-)
-@lightbulb.option("verified_role", "Role to assign when verified.", type=hikari.Role)
-@lightbulb.command("verificationsetup", "Configure the verification system.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def verificationsetup(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-
-    verified: hikari.Role = ctx.options.verified_role
-    unverified: hikari.Role | None = ctx.options.unverified_role
-    unverified_id = unverified.id if unverified else None
-
-    _configs[ctx.guild_id] = {"unverified": unverified_id, "verified": verified.id}
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO verification_config (guild_id, unverified_role_id, verified_role_id)
-            VALUES (?, ?, ?)
-            ON CONFLICT(guild_id) DO UPDATE SET
-                unverified_role_id = excluded.unverified_role_id,
-                verified_role_id   = excluded.verified_role_id
-        """, (ctx.guild_id, unverified_id, verified.id))
-        await db.commit()
-
-    parts = [f"Verified role: {verified.mention}"]
-    if unverified:
-        parts.append(f"Unverified role (removed on verify): {unverified.mention}")
-    await ctx.respond("✅ Verification configured.\n" + "\n".join(parts))
+    except hikari.ForbiddenError:
+        await event.interaction.create_initial_response(
+            hikari.ResponseType.MESSAGE_CREATE,
+            "❌ I don't have permission to give you the verified role.",
+            flags=hikari.MessageFlag.EPHEMERAL,
+        )
+    except Exception as e:
+        logger.warning(f"Verification failed for {user_id}: {e}")
+        await event.interaction.create_initial_response(
+            hikari.ResponseType.MESSAGE_CREATE,
+            "❌ Verification failed. Please contact a moderator.",
+            flags=hikari.MessageFlag.EPHEMERAL,
+        )
 
 
-@plugin.command()
-@lightbulb.option("message", "Text shown above the verify button.", type=str, default="Click the button below to verify and gain access to the server.")
-@lightbulb.command("verificationpanel", "Post the verification button panel in this channel.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def verificationpanel(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    if ctx.guild_id not in _configs:
-        await ctx.respond("❌ Run `/verificationsetup` first.")
-        return
+@loader.command
+class VerificationSetup(
+    lightbulb.SlashCommand,
+    name="verificationsetup",
+    description="Configure the verification system.",
+):
+    role = lightbulb.role("role", "Role to give upon verification.")
+    button_label = lightbulb.string("button_label", "Text on the verify button.", default="Verify")
 
-    embed = hikari.Embed(
-        title="✅ Verification",
-        description=ctx.options.message,
-        color=0x57F287,
-    )
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.ADMINISTRATOR):
+            await ctx.respond("❌ You need the **Administrator** permission.")
+            return
 
-    action_row = (
-        plugin.bot.rest.build_action_row()
-        .add_interactive_button(hikari.ButtonStyle.SUCCESS, VERIFY_BUTTON_ID, label="✅ Verify")
-    )
+        role = self.role
+        _verify_config[ctx.guild_id] = {
+            "role_id": role.id,
+            "channel_id": None,
+            "message_id": None,
+            "button_label": self.button_label,
+        }
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO verification_config (guild_id, role_id, button_label) VALUES (?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET role_id = excluded.role_id, button_label = excluded.button_label
+            """, (ctx.guild_id, role.id, self.button_label))
+            await db.commit()
+        await ctx.respond(
+            f"✅ Verification configured. Role: {role.mention}.\n"
+            f"Use `/verificationpanel` to post the verification panel in a channel."
+        )
 
-    await plugin.bot.rest.create_message(ctx.channel_id, embed=embed, component=action_row)
-    await ctx.respond("✅ Verification panel posted.", flags=hikari.MessageFlag.EPHEMERAL)
 
+@loader.command
+class VerificationPanel(
+    lightbulb.SlashCommand,
+    name="verificationpanel",
+    description="Post a verification panel with a button in this channel.",
+):
+    title = lightbulb.string("title", "Panel title.", default="Server Verification")
+    description = lightbulb.string("description", "Panel description.", default="Click the button below to verify yourself and gain access to the server.")
 
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("Verification extension loaded.")
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.ADMINISTRATOR):
+            await ctx.respond("❌ You need the **Administrator** permission.")
+            return
 
+        cfg = _verify_config.get(ctx.guild_id)
+        if not cfg:
+            await ctx.respond("❌ Please run `/verificationsetup` first.")
+            return
 
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("Verification extension unloaded.")
+        embed = hikari.Embed(
+            title=title,
+            description=description,
+            color=0x00CC99,
+        )
+
+        row = ctx.client.rest.build_message_action_row()
+        row.add_interactive_button(
+            hikari.ButtonStyle.SUCCESS,
+            VERIFY_CUSTOM_ID,
+            label=cfg["button_label"],
+        )
+
+        if _rest is None:
+            await ctx.respond("❌ Not ready.")
+            return
+
+        msg = await _rest.create_message(ctx.channel_id, embed=embed, components=[row])
+        _verify_config[ctx.guild_id]["channel_id"] = ctx.channel_id
+        _verify_config[ctx.guild_id]["message_id"] = msg.id
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE verification_config SET channel_id = ?, message_id = ? WHERE guild_id = ?
+            """, (ctx.channel_id, msg.id, ctx.guild_id))
+            await db.commit()
+
+        await ctx.respond("✅ Verification panel posted!", flags=hikari.MessageFlag.EPHEMERAL)

@@ -5,124 +5,112 @@ import logging
 from config import config
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("CustomCommands")
+
+loader = lightbulb.Loader()
 
 DB_PATH = "atlas.db"
+_rest: hikari.api.RESTClient | None = None
 
-# guild_id -> {name: response}
+# guild_id -> {trigger -> response}
 _commands: dict[int, dict[str, str]] = {}
 
+PREFIX = getattr(config, "PREFIX", "!")
 
-@plugin.listener(hikari.StartedEvent)
+
+@loader.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest
+    _rest = event.app.rest
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS custom_commands (
                 guild_id INTEGER NOT NULL,
-                name     TEXT    NOT NULL,
+                trigger  TEXT    NOT NULL,
                 response TEXT    NOT NULL,
-                PRIMARY KEY (guild_id, name)
+                PRIMARY KEY (guild_id, trigger)
             )
         """)
         await db.commit()
-        async with db.execute("SELECT guild_id, name, response FROM custom_commands") as cur:
-            for guild_id, name, response in await cur.fetchall():
-                _commands.setdefault(guild_id, {})[name] = response
+        async with db.execute("SELECT guild_id, trigger, response FROM custom_commands") as cur:
+            for guild_id, trigger, response in await cur.fetchall():
+                _commands.setdefault(guild_id, {})[trigger.lower()] = response
     logger.info(f"CustomCommands loaded: {sum(len(v) for v in _commands.values())} commands.")
 
 
-@plugin.listener(hikari.GuildMessageCreateEvent)
+@loader.listener(hikari.GuildMessageCreateEvent)
 async def on_message(event: hikari.GuildMessageCreateEvent) -> None:
-    """Prefix-based invocation — requires MESSAGE_CONTENT privileged intent."""
-    if event.author.is_bot or not event.content:
+    if event.author.is_bot or not event.content or _rest is None:
         return
-    if not event.content.startswith(config.PREFIX):
+    content = event.content.strip()
+    if not content.startswith(PREFIX):
         return
-    name = event.content[len(config.PREFIX):].split()[0].lower()
-    response = _commands.get(event.guild_id, {}).get(name)
+    trigger = content[len(PREFIX):].split()[0].lower()
+    guild_cmds = _commands.get(event.guild_id, {})
+    response = guild_cmds.get(trigger)
     if response:
-        await plugin.bot.rest.create_message(event.channel_id, response)
+        try:
+            await _rest.create_message(event.channel_id, response)
+        except Exception as e:
+            logger.warning(f"CustomCommand response failed: {e}")
 
 
-@plugin.command()
-@lightbulb.option("name", "Command name to run.", type=str)
-@lightbulb.command("cmd", "Run a custom server command.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def cmd(ctx: lightbulb.Context) -> None:
-    name = ctx.options.name.strip().lower()
-    response = _commands.get(ctx.guild_id, {}).get(name)
-    if not response:
-        cmds = sorted(_commands.get(ctx.guild_id, {}).keys())
-        hint = f" Available: {', '.join(f'`{c}`' for c in cmds)}" if cmds else ""
-        await ctx.respond(f"❌ No custom command named `{name}`.{hint}")
-        return
-    await ctx.respond(response)
+# /cc group for managing custom commands
+cc_group = lightbulb.Group("cc", "Manage custom text commands.")
 
 
-@plugin.command()
-@lightbulb.command("cc", "Manage custom commands.")
-@lightbulb.implements(lightbulb.SlashCommandGroup)
-async def cc(ctx: lightbulb.Context) -> None:
-    pass
+@cc_group.register
+class CCAdd(lightbulb.SlashCommand, name="add", description="Add a custom command."):
+    trigger = lightbulb.string("trigger", "The command trigger (without prefix).")
+    response = lightbulb.string("response", "The response text.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        trigger = self.trigger.lower().strip()
+        response = self.response
+        _commands.setdefault(ctx.guild_id, {})[trigger] = response
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO custom_commands (guild_id, trigger, response) VALUES (?, ?, ?)
+                ON CONFLICT(guild_id, trigger) DO UPDATE SET response = excluded.response
+            """, (ctx.guild_id, trigger, response))
+            await db.commit()
+        await ctx.respond(f"✅ Custom command `{PREFIX}{trigger}` created.")
 
 
-@cc.child
-@lightbulb.option("response", "What the bot should say.", type=str)
-@lightbulb.option("name", "Command name (no spaces).", type=str)
-@lightbulb.command("add", "Add or update a custom command.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def cc_add(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    name = ctx.options.name.strip().lower().replace(" ", "-")
-    response = ctx.options.response
-    _commands.setdefault(ctx.guild_id, {})[name] = response
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO custom_commands (guild_id, name, response) VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, name) DO UPDATE SET response = excluded.response
-        """, (ctx.guild_id, name, response))
-        await db.commit()
-    await ctx.respond(f"✅ Custom command `{name}` saved. Run it with `/cmd {name}` or `{config.PREFIX}{name}`.")
+@cc_group.register
+class CCRemove(lightbulb.SlashCommand, name="remove", description="Remove a custom command."):
+    trigger = lightbulb.string("trigger", "The command trigger to remove.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        trigger = self.trigger.lower().strip()
+        guild_cmds = _commands.get(ctx.guild_id, {})
+        if trigger not in guild_cmds:
+            await ctx.respond(f"⚠️ No custom command `{PREFIX}{trigger}` found.")
+            return
+        del guild_cmds[trigger]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM custom_commands WHERE guild_id = ? AND trigger = ?", (ctx.guild_id, trigger))
+            await db.commit()
+        await ctx.respond(f"✅ Custom command `{PREFIX}{trigger}` removed.")
 
 
-@cc.child
-@lightbulb.option("name", "Command name to remove.", type=str)
-@lightbulb.command("remove", "Remove a custom command.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def cc_remove(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_GUILD:
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    name = ctx.options.name.strip().lower()
-    _commands.get(ctx.guild_id, {}).pop(name, None)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM custom_commands WHERE guild_id = ? AND name = ?", (ctx.guild_id, name))
-        await db.commit()
-    await ctx.respond(f"✅ Custom command `{name}` removed.")
+@cc_group.register
+class CCList(lightbulb.SlashCommand, name="list", description="List all custom commands."):
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        guild_cmds = _commands.get(ctx.guild_id, {})
+        if not guild_cmds:
+            await ctx.respond("ℹ️ No custom commands set for this server.")
+            return
+        lines = [f"`{PREFIX}{t}` → {r[:60]}" for t, r in list(guild_cmds.items())[:25]]
+        await ctx.respond("**Custom Commands:**\n" + "\n".join(lines))
 
 
-@cc.child
-@lightbulb.command("list", "List all custom commands in this server.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def cc_list(ctx: lightbulb.Context) -> None:
-    cmds = _commands.get(ctx.guild_id, {})
-    if not cmds:
-        await ctx.respond("📭 No custom commands set up. Use `/cc add` to create one.")
-        return
-    lines = ["**Custom Commands**"]
-    for name in sorted(cmds):
-        preview = cmds[name][:80] + ("…" if len(cmds[name]) > 80 else "")
-        lines.append(f"`{name}` — {preview}")
-    await ctx.respond("\n".join(lines))
-
-
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("CustomCommands extension loaded.")
-
-
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("CustomCommands extension unloaded.")
+loader.command(cc_group)

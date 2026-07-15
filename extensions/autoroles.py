@@ -4,130 +4,103 @@ import lightbulb
 import logging
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("Autoroles")
+
+loader = lightbulb.Loader()
 
 DB_PATH = "atlas.db"
 
-# guild_id -> list of (role_id, target) where target in ('all', 'human', 'bot')
-_roles: dict[int, list[tuple[int, str]]] = {}
+# guild_id -> [role_id, ...]
+_autoroles: dict[int, list[int]] = {}
+_rest: hikari.api.RESTClient | None = None
 
 
-@plugin.listener(hikari.StartedEvent)
+@loader.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest
+    _rest = event.app.rest
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS autoroles (
                 guild_id INTEGER NOT NULL,
                 role_id  INTEGER NOT NULL,
-                target   TEXT    NOT NULL DEFAULT 'human',
                 PRIMARY KEY (guild_id, role_id)
             )
         """)
         await db.commit()
-        async with db.execute("SELECT guild_id, role_id, target FROM autoroles") as cur:
-            for guild_id, role_id, target in await cur.fetchall():
-                _roles.setdefault(guild_id, []).append((role_id, target))
-    logger.info("Autoroles DB initialized.")
+        async with db.execute("SELECT guild_id, role_id FROM autoroles") as cur:
+            for guild_id, role_id in await cur.fetchall():
+                _autoroles.setdefault(guild_id, []).append(role_id)
+    logger.info(f"AutoRoles loaded for {len(_autoroles)} guilds.")
 
 
-@plugin.listener(hikari.MemberCreateEvent)
+@loader.listener(hikari.MemberCreateEvent)
 async def on_member_join(event: hikari.MemberCreateEvent) -> None:
-    entries = _roles.get(event.guild_id, [])
-    if not entries:
+    roles = _autoroles.get(event.guild_id)
+    if not roles or _rest is None:
         return
-    is_bot = event.member.is_bot
-    for role_id, target in entries:
-        if target == "bot" and not is_bot:
-            continue
-        if target == "human" and is_bot:
-            continue
+    for role_id in roles:
         try:
-            await plugin.bot.rest.add_role_to_member(event.guild_id, event.member, role_id)
+            await _rest.add_role_to_member(event.guild_id, event.user_id, role_id, reason="AutoRole")
         except Exception as e:
-            logger.warning(f"Autorole {role_id} failed for {event.member}: {e}")
+            logger.warning(f"AutoRole failed to assign role {role_id} in guild {event.guild_id}: {e}")
 
 
-@plugin.command()
-@lightbulb.command("autorole", "Configure roles assigned automatically on join.")
-@lightbulb.implements(lightbulb.SlashCommandGroup)
-async def autorole(ctx: lightbulb.Context) -> None:
-    pass
+# /autorole group
+autorole_group = lightbulb.Group("autorole", "Manage auto-roles assigned to new members.")
 
 
-@autorole.child
-@lightbulb.option(
-    "target",
-    "Who receives this role.",
-    choices=["all", "human", "bot"],
-    default="human",
-)
-@lightbulb.option("role", "Role to auto-assign.", type=hikari.Role)
-@lightbulb.command("add", "Add an autorole.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def autorole_add(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_ROLES:
-        await ctx.respond("❌ You need the **Manage Roles** permission.")
-        return
-    role: hikari.Role = ctx.options.role
-    target: str = ctx.options.target
-    entry = (role.id, target)
-    guild_roles = _roles.setdefault(ctx.guild_id, [])
-    if any(r == role.id for r, _ in guild_roles):
-        await ctx.respond(f"❌ {role.mention} is already an autorole.")
-        return
-    guild_roles.append(entry)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO autoroles (guild_id, role_id, target) VALUES (?, ?, ?)",
-            (ctx.guild_id, role.id, target),
-        )
-        await db.commit()
-    await ctx.respond(f"✅ {role.mention} will now be given to **{target}** members on join.")
+@autorole_group.register
+class AutoRoleAdd(lightbulb.SlashCommand, name="add", description="Add a role to the auto-role list."):
+    role = lightbulb.role("role", "Role to give new members.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_ROLES):
+            await ctx.respond("❌ You need the **Manage Roles** permission.")
+            return
+        role = self.role
+        roles = _autoroles.setdefault(ctx.guild_id, [])
+        if role.id in roles:
+            await ctx.respond(f"⚠️ {role.mention} is already an auto-role.")
+            return
+        roles.append(role.id)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR IGNORE INTO autoroles (guild_id, role_id) VALUES (?, ?)", (ctx.guild_id, role.id))
+            await db.commit()
+        await ctx.respond(f"✅ {role.mention} will now be given to new members.")
 
 
-@autorole.child
-@lightbulb.option("role", "Role to remove.", type=hikari.Role)
-@lightbulb.command("remove", "Remove an autorole.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def autorole_remove(ctx: lightbulb.Context) -> None:
-    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_ROLES:
-        await ctx.respond("❌ You need the **Manage Roles** permission.")
-        return
-    role: hikari.Role = ctx.options.role
-    guild_roles = _roles.get(ctx.guild_id, [])
-    before = len(guild_roles)
-    _roles[ctx.guild_id] = [(r, t) for r, t in guild_roles if r != role.id]
-    if len(_roles[ctx.guild_id]) == before:
-        await ctx.respond(f"❌ {role.mention} is not an autorole.")
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM autoroles WHERE guild_id = ? AND role_id = ?",
-            (ctx.guild_id, role.id),
-        )
-        await db.commit()
-    await ctx.respond(f"✅ Removed {role.mention} from autoroles.")
+@autorole_group.register
+class AutoRoleRemove(lightbulb.SlashCommand, name="remove", description="Remove a role from the auto-role list."):
+    role = lightbulb.role("role", "Role to remove.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_ROLES):
+            await ctx.respond("❌ You need the **Manage Roles** permission.")
+            return
+        role = self.role
+        roles = _autoroles.get(ctx.guild_id, [])
+        if role.id not in roles:
+            await ctx.respond(f"⚠️ {role.mention} is not an auto-role.")
+            return
+        roles.remove(role.id)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM autoroles WHERE guild_id = ? AND role_id = ?", (ctx.guild_id, role.id))
+            await db.commit()
+        await ctx.respond(f"✅ {role.mention} removed from auto-roles.")
 
 
-@autorole.child
-@lightbulb.command("list", "List configured autoroles.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def autorole_list(ctx: lightbulb.Context) -> None:
-    entries = _roles.get(ctx.guild_id, [])
-    if not entries:
-        await ctx.respond("No autoroles configured.")
-        return
-    lines = ["**Autoroles**"]
-    for role_id, target in entries:
-        lines.append(f"<@&{role_id}> — `{target}`")
-    await ctx.respond("\n".join(lines))
+@autorole_group.register
+class AutoRoleList(lightbulb.SlashCommand, name="list", description="List all auto-roles."):
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        roles = _autoroles.get(ctx.guild_id, [])
+        if not roles:
+            await ctx.respond("ℹ️ No auto-roles set for this server.")
+            return
+        role_list = "\n".join(f"<@&{r}>" for r in roles)
+        await ctx.respond(f"**Auto-roles:**\n{role_list}")
 
 
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("Autoroles extension loaded.")
-
-
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("Autoroles extension unloaded.")
+loader.command(autorole_group)

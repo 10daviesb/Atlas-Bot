@@ -3,77 +3,77 @@ import lightbulb
 import logging
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("Info")
+
+loader = lightbulb.Loader()
 
 
-@plugin.command()
-@lightbulb.option("member", "Member to look up (defaults to you).", type=hikari.Member, default=None)
-@lightbulb.command("userinfo", "Show information about a user.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def userinfo(ctx: lightbulb.Context) -> None:
-    target = ctx.options.member or ctx.member
-    roles = [f"<@&{r}>" for r in target.role_ids if r != ctx.guild_id]
+@loader.command
+class UserInfo(lightbulb.SlashCommand, name="userinfo", description="Show information about a user."):
+    user = lightbulb.user("user", "User to look up.", default=None)
 
-    embed = hikari.Embed(title=str(target.display_name), color=0x5865F2)
-    embed.set_thumbnail(target.display_avatar_url or target.user.display_avatar_url)
-    embed.add_field("Username", str(target.user), inline=True)
-    embed.add_field("ID", str(target.id), inline=True)
-    embed.add_field("Bot", "Yes" if target.user.is_bot else "No", inline=True)
-    embed.add_field("Account Created", target.user.created_at.strftime("%d %b %Y"), inline=True)
-    embed.add_field("Joined Server", target.joined_at.strftime("%d %b %Y") if target.joined_at else "Unknown", inline=True)
-    embed.add_field(f"Roles ({len(roles)})", ", ".join(roles) if roles else "None", inline=False)
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        target_user = self.user or ctx.user
+        member: hikari.Member | None = None
+        if ctx.guild_id:
+            try:
+                member = await ctx.client.rest.fetch_member(ctx.guild_id, target_user.id)
+            except hikari.NotFoundError:
+                pass
 
-    await ctx.respond(embed=embed)
-    logger.info(f"userinfo for {target} requested by {ctx.author}")
+        embed = hikari.Embed(title=f"User Info — {target_user.username}", color=0x5865F2)
+        embed.set_thumbnail(target_user.avatar_url or target_user.default_avatar_url)
+        embed.add_field("Username", str(target_user), inline=True)
+        embed.add_field("ID", str(target_user.id), inline=True)
+        embed.add_field("Bot", "Yes" if target_user.is_bot else "No", inline=True)
 
+        created = target_user.created_at
+        embed.add_field("Account Created", f"<t:{int(created.timestamp())}:F>", inline=False)
 
-@plugin.command()
-@lightbulb.command("serverinfo", "Show information about this server.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def serverinfo(ctx: lightbulb.Context) -> None:
-    guild = ctx.get_guild()
-    if not guild:
-        await ctx.respond("❌ Could not fetch server info.")
-        return
+        if member:
+            if member.joined_at:
+                embed.add_field("Joined Server", f"<t:{int(member.joined_at.timestamp())}:F>", inline=False)
+            if member.nickname:
+                embed.add_field("Nickname", member.nickname, inline=True)
+            roles = [f"<@&{r}>" for r in member.role_ids if r != ctx.guild_id]
+            if roles:
+                embed.add_field("Roles", ", ".join(roles[:10]), inline=False)
 
-    channels = plugin.bot.cache.get_guild_channels_view_for_guild(guild.id)
-    text_count = sum(1 for c in channels.values() if isinstance(c, hikari.TextableGuildChannel) and not isinstance(c, hikari.GuildVoiceChannel))
-    voice_count = sum(1 for c in channels.values() if isinstance(c, hikari.GuildVoiceChannel))
-    roles = guild.get_roles()
-
-    embed = hikari.Embed(title=guild.name, color=0x5865F2)
-    if guild.icon_url:
-        embed.set_thumbnail(guild.icon_url)
-    embed.add_field("Owner", f"<@{guild.owner_id}>", inline=True)
-    embed.add_field("Created", guild.created_at.strftime("%d %b %Y"), inline=True)
-    embed.add_field("Members", str(guild.member_count or "?"), inline=True)
-    embed.add_field("Text Channels", str(text_count), inline=True)
-    embed.add_field("Voice Channels", str(voice_count), inline=True)
-    embed.add_field("Roles", str(len(roles)), inline=True)
-    embed.set_footer(text=f"ID: {guild.id}")
-
-    await ctx.respond(embed=embed)
-    logger.info(f"serverinfo requested by {ctx.author} in guild {guild.id}")
+        await ctx.respond(embed=embed)
 
 
-@plugin.command()
-@lightbulb.option("member", "Member whose avatar to show (defaults to you).", type=hikari.Member, default=None)
-@lightbulb.command("avatar", "Show a user's avatar.")
-@lightbulb.implements(lightbulb.SlashCommand)
-async def avatar(ctx: lightbulb.Context) -> None:
-    target = ctx.options.member or ctx.member
-    url = target.display_avatar_url or target.user.display_avatar_url
+@loader.command
+class ServerInfo(lightbulb.SlashCommand, name="serverinfo", description="Show information about this server."):
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.guild_id:
+            await ctx.respond("❌ This command can only be used in a server.")
+            return
 
-    embed = hikari.Embed(title=f"{target.display_name}'s Avatar", color=0x5865F2)
-    embed.set_image(url)
-    await ctx.respond(embed=embed)
+        guild = await ctx.client.rest.fetch_guild(ctx.guild_id)
+        owner = await ctx.client.rest.fetch_user(guild.owner_id)
+
+        embed = hikari.Embed(title=guild.name, color=0x5865F2)
+        if guild.icon_url:
+            embed.set_thumbnail(guild.icon_url)
+        embed.add_field("Owner", str(owner), inline=True)
+        embed.add_field("ID", str(guild.id), inline=True)
+        embed.add_field("Member Count", str(guild.member_count), inline=True)
+        embed.add_field("Created", f"<t:{int(guild.created_at.timestamp())}:F>", inline=False)
+        embed.add_field("Boost Level", str(guild.premium_tier), inline=True)
+        embed.add_field("Boosts", str(guild.premium_subscription_count or 0), inline=True)
+
+        await ctx.respond(embed=embed)
 
 
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("Info extension loaded.")
+@loader.command
+class Avatar(lightbulb.SlashCommand, name="avatar", description="Show a user's avatar."):
+    user = lightbulb.user("user", "User whose avatar to show.", default=None)
 
-
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("Info extension unloaded.")
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        target = self.user or ctx.user
+        url = target.avatar_url or target.default_avatar_url
+        embed = hikari.Embed(title=f"{target.username}'s Avatar", color=0x5865F2)
+        embed.set_image(url)
+        await ctx.respond(embed=embed)

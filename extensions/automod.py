@@ -1,33 +1,39 @@
-import datetime
 import re
 import time
-from collections import defaultdict
-
 import aiosqlite
 import hikari
 import lightbulb
 import logging
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("AutoMod")
+
+loader = lightbulb.Loader()
 
 DB_PATH = "atlas.db"
-SPAM_THRESHOLD = 5    # messages within window triggers timeout
-SPAM_WINDOW = 5.0     # seconds
-SPAM_TIMEOUT = 60     # seconds to timeout for
 
-URL_PATTERN = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+# guild_id -> {words, block_links, log_channel, spam_limit}
+_settings: dict[int, dict] = {}
+# guild_id -> {user_id -> [timestamps]}
+_spam_tracker: dict[int, dict[int, list[float]]] = {}
 
-# (guild_id, user_id) -> list of recent message timestamps
-_message_times: dict[tuple[int, int], list[float]] = defaultdict(list)
+_rest: hikari.api.RESTClient | None = None
 
-# guild_id -> {"spam": bool, "links": bool}
-_settings: dict[int, dict[str, bool]] = defaultdict(lambda: {"spam": True, "links": False})
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
-@plugin.listener(hikari.StartedEvent)
+@loader.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
+    global _rest
+    _rest = event.app.rest
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS automod_settings (
+                guild_id    INTEGER PRIMARY KEY,
+                block_links INTEGER NOT NULL DEFAULT 0,
+                log_channel INTEGER,
+                spam_limit  INTEGER NOT NULL DEFAULT 0
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS automod_words (
                 guild_id INTEGER NOT NULL,
@@ -35,194 +41,213 @@ async def on_started(event: hikari.StartedEvent) -> None:
                 PRIMARY KEY (guild_id, word)
             )
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS automod_settings (
-                guild_id      INTEGER PRIMARY KEY,
-                spam_enabled  INTEGER NOT NULL DEFAULT 1,
-                links_enabled INTEGER NOT NULL DEFAULT 0
-            )
-        """)
         await db.commit()
-        async with db.execute("SELECT guild_id, spam_enabled, links_enabled FROM automod_settings") as cur:
-            for guild_id, spam, links in await cur.fetchall():
-                _settings[guild_id] = {"spam": bool(spam), "links": bool(links)}
-    logger.info("AutoMod DB initialized.")
+        async with db.execute("SELECT guild_id, block_links, log_channel, spam_limit FROM automod_settings") as cur:
+            for guild_id, block_links, log_channel, spam_limit in await cur.fetchall():
+                _settings[guild_id] = {
+                    "words": [],
+                    "block_links": bool(block_links),
+                    "log_channel": log_channel,
+                    "spam_limit": spam_limit,
+                }
+        async with db.execute("SELECT guild_id, word FROM automod_words") as cur:
+            for guild_id, word in await cur.fetchall():
+                if guild_id in _settings:
+                    _settings[guild_id]["words"].append(word.lower())
+    logger.info(f"AutoMod loaded for {len(_settings)} guilds.")
 
 
-async def _banned_words(guild_id: int) -> set[str]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT word FROM automod_words WHERE guild_id = ?", (guild_id,)) as cur:
-            return {row[0] for row in await cur.fetchall()}
-
-
-async def _save_settings(guild_id: int) -> None:
-    s = _settings[guild_id]
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO automod_settings (guild_id, spam_enabled, links_enabled) VALUES (?, ?, ?)
-            ON CONFLICT(guild_id) DO UPDATE SET spam_enabled = excluded.spam_enabled, links_enabled = excluded.links_enabled
-        """, (guild_id, int(s["spam"]), int(s["links"])))
-        await db.commit()
-
-
-@plugin.listener(hikari.GuildMessageCreateEvent)
+@loader.listener(hikari.GuildMessageCreateEvent)
 async def on_message(event: hikari.GuildMessageCreateEvent) -> None:
-    if event.author.is_bot or not event.content:
+    if not event.content or event.author.is_bot or _rest is None:
+        return
+    cfg = _settings.get(event.guild_id)
+    if not cfg:
         return
 
-    settings = _settings[event.guild_id]
-    content = event.content
+    content_lower = event.content.lower()
+    reason: str | None = None
 
-    # Word filter
-    banned = await _banned_words(event.guild_id)
-    if banned and set(re.findall(r"\w+", content.lower())) & banned:
-        try:
-            await plugin.bot.rest.delete_message(event.channel_id, event.message_id)
-            await plugin.bot.rest.create_message(
-                event.channel_id,
-                f"⚠️ {event.author.mention}, your message was removed for containing a banned word."
-            )
-        except Exception as e:
-            logger.warning(f"AutoMod word filter failed: {e}")
-        return
+    # Banned words
+    for word in cfg["words"]:
+        if word in content_lower:
+            reason = f"banned word: `{word}`"
+            break
 
-    # Link filter
-    if settings["links"] and URL_PATTERN.search(content):
-        try:
-            await plugin.bot.rest.delete_message(event.channel_id, event.message_id)
-            await plugin.bot.rest.create_message(
-                event.channel_id,
-                f"⚠️ {event.author.mention}, links are not allowed in this server."
-            )
-        except Exception as e:
-            logger.warning(f"AutoMod link filter failed: {e}")
-        return
+    # Link blocking
+    if not reason and cfg["block_links"] and URL_RE.search(event.content):
+        reason = "links are not allowed"
 
     # Spam detection
-    if settings["spam"]:
-        key = (event.guild_id, event.author_id)
+    if not reason and cfg["spam_limit"] > 0:
         now = time.monotonic()
-        times = [t for t in _message_times[key] if now - t < SPAM_WINDOW]
-        times.append(now)
-        _message_times[key] = times
+        tracker = _spam_tracker.setdefault(event.guild_id, {})
+        timestamps = tracker.setdefault(event.author_id, [])
+        timestamps.append(now)
+        tracker[event.author_id] = [t for t in timestamps if now - t < 5]
+        if len(tracker[event.author_id]) > cfg["spam_limit"]:
+            reason = "spam detected"
+            tracker[event.author_id] = []
 
-        if len(times) >= SPAM_THRESHOLD:
-            _message_times[key] = []
-            until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=SPAM_TIMEOUT)
+    if reason:
+        try:
+            await _rest.delete_message(event.channel_id, event.message_id)
+        except Exception:
+            pass
+        try:
+            warn = await _rest.create_message(
+                event.channel_id,
+                f"⚠️ {event.author.mention}, your message was removed: **{reason}**."
+            )
+            await _rest.delete_message(event.channel_id, warn.id)
+        except Exception:
+            pass
+        log_ch = cfg.get("log_channel")
+        if log_ch:
             try:
-                await plugin.bot.rest.edit_member(
-                    event.guild_id, event.author_id,
-                    communication_disabled_until=until,
+                await _rest.create_message(
+                    log_ch,
+                    f"🚫 AutoMod removed a message by **{event.author}** in <#{event.channel_id}>.\n**Reason:** {reason}"
                 )
-                await plugin.bot.rest.create_message(
-                    event.channel_id,
-                    f"⚠️ {event.author.mention} has been timed out for **{SPAM_TIMEOUT}s** for spamming."
-                )
-                logger.info(f"AutoMod: timed out {event.author} for spam in guild {event.guild_id}")
-            except Exception as e:
-                logger.warning(f"AutoMod spam timeout failed: {e}")
+            except Exception:
+                pass
 
 
-def _has_manage_guild(ctx: lightbulb.Context) -> bool:
-    return isinstance(ctx.member, hikari.Member) and bool(ctx.member.permissions & hikari.Permissions.MANAGE_GUILD)
+# /automod group
+automod_group = lightbulb.Group("automod", "Configure AutoMod.")
 
 
-@plugin.command()
-@lightbulb.command("automod", "Manage auto-moderation settings.")
-@lightbulb.implements(lightbulb.SlashCommandGroup)
-async def automod(ctx: lightbulb.Context) -> None:
-    pass
+@automod_group.register
+class AutoModAddWord(lightbulb.SlashCommand, name="addword", description="Add a banned word."):
+    word = lightbulb.string("word", "Word to ban.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        word = self.word.lower().strip()
+        cfg = _settings.setdefault(ctx.guild_id, {"words": [], "block_links": False, "log_channel": None, "spam_limit": 0})
+        if word not in cfg["words"]:
+            cfg["words"].append(word)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, block_links, log_channel, spam_limit)
+                VALUES (?, 0, NULL, 0)
+                ON CONFLICT(guild_id) DO NOTHING
+            """, (ctx.guild_id,))
+            await db.execute("INSERT OR IGNORE INTO automod_words (guild_id, word) VALUES (?, ?)", (ctx.guild_id, word))
+            await db.commit()
+        await ctx.respond(f"✅ `{word}` added to banned words.")
 
 
-@automod.child
-@lightbulb.option("enabled", "Turn spam detection on or off.", type=bool)
-@lightbulb.command("spam", "Toggle spam detection.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def automod_spam(ctx: lightbulb.Context) -> None:
-    if not _has_manage_guild(ctx):
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    _settings[ctx.guild_id]["spam"] = ctx.options.enabled
-    await _save_settings(ctx.guild_id)
-    await ctx.respond(f"✅ Spam detection {'enabled' if ctx.options.enabled else 'disabled'}.")
+@automod_group.register
+class AutoModRemoveWord(lightbulb.SlashCommand, name="removeword", description="Remove a banned word."):
+    word = lightbulb.string("word", "Word to unban.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        word = self.word.lower().strip()
+        cfg = _settings.get(ctx.guild_id)
+        if cfg and word in cfg["words"]:
+            cfg["words"].remove(word)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM automod_words WHERE guild_id = ? AND word = ?", (ctx.guild_id, word))
+            await db.commit()
+        await ctx.respond(f"✅ `{word}` removed from banned words.")
 
 
-@automod.child
-@lightbulb.option("enabled", "Turn link blocking on or off.", type=bool)
-@lightbulb.command("links", "Toggle link blocking.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def automod_links(ctx: lightbulb.Context) -> None:
-    if not _has_manage_guild(ctx):
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    _settings[ctx.guild_id]["links"] = ctx.options.enabled
-    await _save_settings(ctx.guild_id)
-    await ctx.respond(f"✅ Link blocking {'enabled' if ctx.options.enabled else 'disabled'}.")
+@automod_group.register
+class AutoModLinks(lightbulb.SlashCommand, name="links", description="Toggle link blocking."):
+    enabled = lightbulb.boolean("enabled", "Whether to block links.")
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        cfg = _settings.setdefault(ctx.guild_id, {"words": [], "block_links": False, "log_channel": None, "spam_limit": 0})
+        cfg["block_links"] = self.enabled
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, block_links, log_channel, spam_limit)
+                VALUES (?, ?, NULL, 0)
+                ON CONFLICT(guild_id) DO UPDATE SET block_links = excluded.block_links
+            """, (ctx.guild_id, int(self.enabled)))
+            await db.commit()
+        status = "enabled" if self.enabled else "disabled"
+        await ctx.respond(f"✅ Link blocking is now **{status}**.")
 
 
-@automod.child
-@lightbulb.option("word", "Word to ban.", type=str)
-@lightbulb.command("addword", "Add a word to the filter.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def automod_addword(ctx: lightbulb.Context) -> None:
-    if not _has_manage_guild(ctx):
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    word = ctx.options.word.lower().strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO automod_words (guild_id, word) VALUES (?, ?)", (ctx.guild_id, word))
-        await db.commit()
-    await ctx.respond(f"✅ `{word}` added to the word filter.")
+@automod_group.register
+class AutoModSpam(lightbulb.SlashCommand, name="spam", description="Set spam message limit (0 = disabled)."):
+    limit = lightbulb.integer("limit", "Max messages per 5 seconds (0 to disable).", min_value=0, max_value=50)
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        cfg = _settings.setdefault(ctx.guild_id, {"words": [], "block_links": False, "log_channel": None, "spam_limit": 0})
+        cfg["spam_limit"] = self.limit
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, block_links, log_channel, spam_limit)
+                VALUES (?, 0, NULL, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET spam_limit = excluded.spam_limit
+            """, (ctx.guild_id, self.limit))
+            await db.commit()
+        if self.limit == 0:
+            await ctx.respond("✅ Spam detection disabled.")
+        else:
+            await ctx.respond(f"✅ Spam detection set: max **{self.limit}** messages per 5 seconds.")
 
 
-@automod.child
-@lightbulb.option("word", "Word to remove.", type=str)
-@lightbulb.command("removeword", "Remove a word from the filter.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def automod_removeword(ctx: lightbulb.Context) -> None:
-    if not _has_manage_guild(ctx):
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    word = ctx.options.word.lower().strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM automod_words WHERE guild_id = ? AND word = ?", (ctx.guild_id, word))
-        await db.commit()
-    await ctx.respond(f"✅ `{word}` removed from the word filter.")
+@automod_group.register
+class AutoModLogChannel(lightbulb.SlashCommand, name="log", description="Set the AutoMod log channel."):
+    channel = lightbulb.channel("channel", "Channel to send mod logs.", default=None)
+
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        if not ctx.member or not (ctx.member.permissions & hikari.Permissions.MANAGE_GUILD):
+            await ctx.respond("❌ You need the **Manage Server** permission.")
+            return
+        channel = self.channel
+        channel_id = channel.id if channel else None
+        cfg = _settings.setdefault(ctx.guild_id, {"words": [], "block_links": False, "log_channel": None, "spam_limit": 0})
+        cfg["log_channel"] = channel_id
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO automod_settings (guild_id, block_links, log_channel, spam_limit)
+                VALUES (?, 0, ?, 0)
+                ON CONFLICT(guild_id) DO UPDATE SET log_channel = excluded.log_channel
+            """, (ctx.guild_id, channel_id))
+            await db.commit()
+        if channel:
+            await ctx.respond(f"✅ AutoMod logs will be sent to {channel.mention}.")
+        else:
+            await ctx.respond("✅ AutoMod log channel cleared.")
 
 
-@automod.child
-@lightbulb.command("listwords", "Show all filtered words.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def automod_listwords(ctx: lightbulb.Context) -> None:
-    if not _has_manage_guild(ctx):
-        await ctx.respond("❌ You need the **Manage Server** permission.")
-        return
-    words = await _banned_words(ctx.guild_id)
-    if not words:
-        await ctx.respond("📭 No words are currently filtered.")
-        return
-    await ctx.respond(f"**Filtered words:** {', '.join(f'`{w}`' for w in sorted(words))}")
+@automod_group.register
+class AutoModList(lightbulb.SlashCommand, name="list", description="List banned words and settings."):
+    @lightbulb.invoke
+    async def invoke(self, ctx: lightbulb.Context) -> None:
+        cfg = _settings.get(ctx.guild_id)
+        if not cfg:
+            await ctx.respond("ℹ️ No AutoMod settings configured for this server.")
+            return
+        words = ", ".join(f"`{w}`" for w in cfg["words"]) or "*none*"
+        embed = hikari.Embed(title="AutoMod Settings", color=0x5865F2)
+        embed.add_field("Banned Words", words, inline=False)
+        embed.add_field("Link Blocking", "Enabled" if cfg["block_links"] else "Disabled", inline=True)
+        embed.add_field("Spam Limit", str(cfg["spam_limit"]) if cfg["spam_limit"] else "Disabled", inline=True)
+        log_ch = cfg.get("log_channel")
+        embed.add_field("Log Channel", f"<#{log_ch}>" if log_ch else "Not set", inline=True)
+        await ctx.respond(embed=embed)
 
 
-@automod.child
-@lightbulb.command("status", "Show current AutoMod settings.")
-@lightbulb.implements(lightbulb.SlashSubCommand)
-async def automod_status(ctx: lightbulb.Context) -> None:
-    s = _settings[ctx.guild_id]
-    words = await _banned_words(ctx.guild_id)
-    await ctx.respond(
-        f"**AutoMod Status**\n"
-        f"Spam detection: {'✅' if s['spam'] else '❌'}\n"
-        f"Link blocking: {'✅' if s['links'] else '❌'}\n"
-        f"Filtered words: {len(words)}"
-    )
-
-
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("AutoMod extension loaded.")
-
-
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("AutoMod extension unloaded.")
+loader.command(automod_group)

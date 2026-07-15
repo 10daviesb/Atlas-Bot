@@ -5,61 +5,31 @@ from config import config
 from errors import ExtensionDisabledError, CommandDisabledError, MissingCommandRoleError
 
 logger = logging.getLogger(__name__)
-plugin = lightbulb.Plugin("ErrorHandler")
+
+loader = lightbulb.Loader()
 
 
-@plugin.listener(lightbulb.CommandErrorEvent)
-async def on_command_error(event: lightbulb.CommandErrorEvent) -> None:
-    error = event.exception.__cause__ or event.exception
+@loader.error_handler
+async def on_error(exc: Exception, ctx: lightbulb.Context) -> bool:
+    if isinstance(exc, ExtensionDisabledError):
+        await ctx.respond(f"❌ The **{exc.extension}** extension is disabled in this server.")
+        return True
 
-    if isinstance(error, lightbulb.CommandNotFound):
-        return
+    if isinstance(exc, CommandDisabledError):
+        await ctx.respond(f"❌ The command **{exc.command}** is disabled in this server.")
+        return True
 
-    if isinstance(error, lightbulb.NotEnoughArguments):
-        await event.context.respond("❌ Missing required arguments.")
-        return
+    if isinstance(exc, MissingCommandRoleError):
+        await ctx.respond(f"❌ You need the <@&{exc.role_id}> role to use this command.")
+        return True
 
-    if isinstance(error, ExtensionDisabledError):
-        await event.context.respond(f"❌ The **{error.extension.title()}** extension is disabled in this server.")
-        return
+    # Log unhandled errors
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logger.error(f"Unhandled command error:\n{tb}")
 
-    if isinstance(error, CommandDisabledError):
-        await event.context.respond(f"❌ The `/{error.command}` command is disabled in this server.")
-        return
+    if config.DEBUG:
+        await ctx.respond(f"❌ An error occurred:\n```py\n{tb[:1900]}```")
+    else:
+        await ctx.respond("❌ An unexpected error occurred. Please try again later.")
 
-    if isinstance(error, MissingCommandRoleError):
-        await event.context.respond(f"❌ You need the <@&{error.role_id}> role to use this command.")
-        return
-
-    if isinstance(error, lightbulb.CheckFailure):
-        await event.context.respond("❌ You don't have permission to use this command.")
-        return
-
-    if isinstance(error, lightbulb.CommandIsOnCooldown):
-        await event.context.respond(f"⏳ This command is on cooldown. Try again in **{error.retry_after:.1f}s**.")
-        return
-
-    await event.context.respond("❌ An unexpected error occurred. It has been logged.")
-    logger.exception(f"Unhandled error in '/{event.context.command.name}'", exc_info=error)
-
-    if config.ERROR_LOG_CHANNEL:
-        tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-        content = (
-            f"**Error in `/{event.context.command.name}`** "
-            f"— guild `{event.context.guild_id}` — user `{event.context.author}`\n"
-            f"```py\n{tb[:1900]}\n```"
-        )
-        try:
-            await plugin.bot.rest.create_message(config.ERROR_LOG_CHANNEL, content)
-        except Exception:
-            logger.exception("Failed to post error to ERROR_LOG_CHANNEL")
-
-
-def load(bot):
-    bot.add_plugin(plugin)
-    logger.info("ErrorHandler extension loaded.")
-
-
-def unload(bot):
-    bot.remove_plugin(plugin)
-    logger.info("ErrorHandler extension unloaded.")
+    return True
