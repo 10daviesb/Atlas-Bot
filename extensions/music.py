@@ -1,4 +1,6 @@
+import random
 import ongaku
+import ongaku.events as ongaku_events
 import hikari
 import lightbulb
 import logging
@@ -8,6 +10,7 @@ logger = logging.getLogger(__name__)
 plugin = lightbulb.Plugin("Music")
 
 _client: ongaku.Client | None = None
+_loop_modes: dict[int, bool] = {}  # guild_id -> loop enabled
 
 
 def _get_client() -> ongaku.Client:
@@ -170,6 +173,47 @@ async def queue(ctx: lightbulb.Context) -> None:
     if len(player.queue) > 9:
         lines.append(f"*...and {len(player.queue) - 9} more*")
     await ctx.respond("\n".join(lines))
+
+
+@plugin.listener(ongaku_events.TrackEndEvent)
+async def on_track_end(event: ongaku_events.TrackEndEvent) -> None:
+    if not _loop_modes.get(event.guild_id):
+        return
+    if getattr(event, "reason", None) in ("STOPPED", "REPLACED"):
+        return
+    player = _get_client().fetch_player(event.guild_id)
+    if not player or not event.track:
+        return
+    await player.add(event.track)
+    if not player.track:
+        await player.play()
+
+
+@plugin.command()
+@lightbulb.command("loop", "Toggle loop mode for the current track.")
+@lightbulb.implements(lightbulb.SlashCommand)
+async def loop(ctx: lightbulb.Context) -> None:
+    player = _get_client().fetch_player(ctx.guild_id)
+    if not player or not player.track:
+        await ctx.respond("❌ Nothing is playing.")
+        return
+    _loop_modes[ctx.guild_id] = not _loop_modes.get(ctx.guild_id, False)
+    status = "enabled" if _loop_modes[ctx.guild_id] else "disabled"
+    await ctx.respond(f"🔁 Loop **{status}**.")
+    logger.info(f"Loop {status} in guild {ctx.guild_id}")
+
+
+@plugin.command()
+@lightbulb.command("shuffle", "Shuffle the queue.")
+@lightbulb.implements(lightbulb.SlashCommand)
+async def shuffle(ctx: lightbulb.Context) -> None:
+    player = _get_client().fetch_player(ctx.guild_id)
+    if not player or not player.queue:
+        await ctx.respond("❌ Nothing in the queue to shuffle.")
+        return
+    random.shuffle(player.queue)
+    await ctx.respond("🔀 Queue shuffled!")
+    logger.info(f"{ctx.author} shuffled queue in guild {ctx.guild_id}")
 
 
 @plugin.command()

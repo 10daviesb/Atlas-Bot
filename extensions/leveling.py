@@ -31,6 +31,10 @@ def xp_progress(total_xp: int) -> tuple[int, int, int]:
     return level, remaining, xp_for_level(level)
 
 
+# guild_id -> {level: role_id}
+_level_roles: dict[int, dict[int, int]] = {}
+
+
 @plugin.listener(hikari.StartedEvent)
 async def on_started(event: hikari.StartedEvent) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -42,7 +46,18 @@ async def on_started(event: hikari.StartedEvent) -> None:
                 PRIMARY KEY (guild_id, user_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS level_roles (
+                guild_id INTEGER NOT NULL,
+                level    INTEGER NOT NULL,
+                role_id  INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, level)
+            )
+        """)
         await db.commit()
+        async with db.execute("SELECT guild_id, level, role_id FROM level_roles") as cur:
+            for guild_id, level, role_id in await cur.fetchall():
+                _level_roles.setdefault(guild_id, {})[level] = role_id
     logger.info("Leveling DB initialized.")
 
 
@@ -84,6 +99,15 @@ async def on_message(event: hikari.GuildMessageCreateEvent) -> None:
             f"🎉 {event.author.mention} levelled up to **Level {new_level}**!",
         )
         logger.info(f"{event.author} reached level {new_level} in guild {event.guild_id}")
+        guild_roles = _level_roles.get(event.guild_id, {})
+        for lvl in range(old_level + 1, new_level + 1):
+            if lvl in guild_roles:
+                try:
+                    await plugin.bot.rest.add_role_to_member(
+                        event.guild_id, event.author_id, guild_roles[lvl]
+                    )
+                except Exception as e:
+                    logger.warning(f"Level role assign failed (level {lvl}): {e}")
 
 
 @plugin.command()
@@ -137,6 +161,74 @@ async def leaderboard(ctx: lightbulb.Context) -> None:
 
     await ctx.respond("\n".join(lines))
     logger.info(f"leaderboard viewed by {ctx.author} in guild {ctx.guild_id}")
+
+
+@plugin.command()
+@lightbulb.command("levelrole", "Configure roles awarded at certain levels.")
+@lightbulb.implements(lightbulb.SlashCommandGroup)
+async def levelrole(ctx: lightbulb.Context) -> None:
+    pass
+
+
+@levelrole.child
+@lightbulb.option("role", "Role to award.", type=hikari.Role)
+@lightbulb.option("level", "Level that triggers this role.", type=int)
+@lightbulb.command("add", "Award a role when members reach a level.")
+@lightbulb.implements(lightbulb.SlashSubCommand)
+async def levelrole_add(ctx: lightbulb.Context) -> None:
+    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_ROLES:
+        await ctx.respond("❌ You need the **Manage Roles** permission.")
+        return
+    lvl: int = ctx.options.level
+    role: hikari.Role = ctx.options.role
+    if lvl < 1:
+        await ctx.respond("❌ Level must be at least 1.")
+        return
+    _level_roles.setdefault(ctx.guild_id, {})[lvl] = role.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO level_roles (guild_id, level, role_id) VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, level) DO UPDATE SET role_id = excluded.role_id
+        """, (ctx.guild_id, lvl, role.id))
+        await db.commit()
+    await ctx.respond(f"✅ {role.mention} will be awarded at **Level {lvl}**.")
+
+
+@levelrole.child
+@lightbulb.option("level", "Level to remove the role from.", type=int)
+@lightbulb.command("remove", "Remove a level role.")
+@lightbulb.implements(lightbulb.SlashSubCommand)
+async def levelrole_remove(ctx: lightbulb.Context) -> None:
+    if not isinstance(ctx.member, hikari.Member) or not ctx.member.permissions & hikari.Permissions.MANAGE_ROLES:
+        await ctx.respond("❌ You need the **Manage Roles** permission.")
+        return
+    lvl: int = ctx.options.level
+    guild_roles = _level_roles.get(ctx.guild_id, {})
+    if lvl not in guild_roles:
+        await ctx.respond(f"❌ No level role set for Level {lvl}.")
+        return
+    del guild_roles[lvl]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM level_roles WHERE guild_id = ? AND level = ?",
+            (ctx.guild_id, lvl),
+        )
+        await db.commit()
+    await ctx.respond(f"✅ Level role for **Level {lvl}** removed.")
+
+
+@levelrole.child
+@lightbulb.command("list", "List all level roles.")
+@lightbulb.implements(lightbulb.SlashSubCommand)
+async def levelrole_list(ctx: lightbulb.Context) -> None:
+    guild_roles = _level_roles.get(ctx.guild_id, {})
+    if not guild_roles:
+        await ctx.respond("No level roles configured.")
+        return
+    lines = ["**Level Roles**"]
+    for lvl in sorted(guild_roles):
+        lines.append(f"Level **{lvl}** → <@&{guild_roles[lvl]}>")
+    await ctx.respond("\n".join(lines))
 
 
 def load(bot):

@@ -29,4 +29,7 @@ class Config:
         self.LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
         self.LAVALINK_SSL = os.getenv("LAVALINK_SSL", "False").lower() == "true"
 
+        self.TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "")
+        self.TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "")
+
 config = Config()
